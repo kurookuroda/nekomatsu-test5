@@ -763,25 +763,29 @@ def event_text(ev):
 
 
 def cat_state_text(cid, state):
-    """猫の外から見た描写を返す"""
+    """猫の外から見た描写を返す（フレーム間で安定）"""
     c = state["cats"][cid]
     fullness = c["fullness"]
     toy = c.get("toy")
 
+    def _pick(key, descs):
+        idx = hash((cid, key, int(fullness * 10))) % len(descs)
+        return descs[idx]
+
     # まずおもちゃで遊んでいる描写を優先
     if toy and c["in_yard"]:
         descs = catalog.CAT_TOY_DESCRIPTIONS.get(toy, catalog.CAT_TOY_DESCRIPTIONS["default"])
-        return random.choice(descs)
+        return _pick(f"toy_{toy}", descs)
 
     # 満腹度に応じた描写
     if fullness < 0.2:
-        return random.choice(catalog.CAT_STATE_DESCRIPTIONS["very_hungry"])
+        return _pick("very_hungry", catalog.CAT_STATE_DESCRIPTIONS["very_hungry"])
     elif fullness < 0.5:
-        return random.choice(catalog.CAT_STATE_DESCRIPTIONS["hungry"])
+        return _pick("hungry", catalog.CAT_STATE_DESCRIPTIONS["hungry"])
     elif fullness < 0.8:
-        return random.choice(catalog.CAT_STATE_DESCRIPTIONS["content"])
+        return _pick("content", catalog.CAT_STATE_DESCRIPTIONS["content"])
     else:
-        return random.choice(catalog.CAT_STATE_DESCRIPTIONS["full"])
+        return _pick("full", catalog.CAT_STATE_DESCRIPTIONS["full"])
 
 
 # ---------------------------------------------------------------------------
