@@ -525,7 +525,7 @@ class App:
     def draw_yard(self):
         s = self.state
         if s["food"]:
-            self.tx(8, 22, "エサ: {0} 残り{1}分".format(game.FOODS[s["food"]]["name"], s["food_remaining"]), C_GOOD)
+            self.tx(8, 22, "エサ: {0} 残り{1}".format(game.FOODS[s["food"]]["name"], s["food_remaining"]), C_GOOD)
         else:
             self.tx(8, 22, "エサがありません(もちもの→エサ)", C_BAD)
 
@@ -762,7 +762,7 @@ class App:
         if it["kind"] == "toy" and it["size"] > 1:
             info += "(庭を{0}マス使う)".format(it["size"])
         if it["kind"] == "food":
-            info += "(約{0}分もつ)".format(it["minutes"])
+            info += "(量{0})".format(it["minutes"])
         return info
 
     def select_shop(self, item_id):
@@ -823,7 +823,7 @@ class App:
 
         self.draw_panel(8, 196, SCREEN_W - 16, 28)
         if s["food"]:
-            self.tx(14, 203, "庭のエサ: {0} 残り{1}分".format(game.FOODS[s["food"]]["name"], s["food_remaining"]), C_GOOD)
+            self.tx(14, 203, "庭のサ: {0} 残り{1}".format(game.FOODS[s["food"]]["name"], s["food_remaining"]), C_GOOD)
         else:
             self.tx(14, 203, "庭のエサ: なし", C_BAD)
 
