@@ -21,7 +21,7 @@ from audio import AudioManager
 
 
 # フェーズ1・2: ショップの種別（SHOP_KINDS はフェーズ3以降）
-SHOP_KINDS = [("toy", "おもちゃ"), ("food", "エサ")]
+SHOP_KINDS = [("toy", "おもちゃ"), ("food", "エサ"), ("goods", "取引品")]
 
 
 class App:
@@ -473,6 +473,20 @@ class App:
         pyxel.rect(0, 0, SCREEN_W, HEADER_H, C_PANEL)
         self.tx(6, 3, "銀 {0}".format(s["s_fish"]), C_SILVER)
         self.tx(76, 3, "金 {0}".format(s["g_fish"]), C_GOLD)
+        # 【フェーズ3】場所切り替え（にわタブのとき）
+        if self.screen == "yard":
+            places = game.available_places(s)
+            if len(places) > 1:
+                x = 140
+                for p in places:
+                    name = game.PLACES[p]["name"]
+                    active = p == s["current_place"]
+                    col = C_ACCENT if active else C_SUB
+                    w = self.tw(name) + 8
+                    self.tx(x, 3, name, col)
+                    if not active:
+                        self.hit(x, 0, w, HEADER_H, lambda pid=p: self.do_switch_place(pid))
+                    x += w + 8
         title = dict(TABS)[self.screen]
         self.tx_right(SCREEN_W - 6, 3, title, C_SUB)
 
@@ -531,6 +545,7 @@ class App:
 
         # 【フェーズ1・2】庭にいる猫の満腹度状態を表示
         in_yard = [(cid, s["cats"][cid]) for cid in s["cats"] if s["cats"][cid]["in_yard"]]
+        y_cat_bottom = 34  # エサ表示の下
         if in_yard:
             y_cat = 34
             for cid, c in in_yard:
@@ -546,8 +561,9 @@ class App:
                     state_text = "お腹いっぱい"
                 self.tx(8, y_cat, "{0}: {1}".format(name, state_text), C_SUB)
                 y_cat += LINE_H
+            y_cat_bottom = y_cat  # 猫表示の最終y位置
 
-        y = 38
+        y = y_cat_bottom + 4  # 猫表示の下からおもちゃリストを開始
         yard_bottom = y
         if not s["yard"]:
             for i, line in enumerate(self.wrap("庭にはおもちゃがありません。ショップで買って、もちものから置こう", SCREEN_W - 16)):
@@ -564,6 +580,9 @@ class App:
             else:
                 self.tx_right(SCREEN_W - 8, y + i * ROW_H, "(空き)", C_DIM)
             yard_bottom = y + (i + 1) * ROW_H
+
+        # 【フェーズ3】アクター表示
+        yard_bottom = self._draw_actors(yard_bottom + 6)
 
         # 「できごと」見出し→区切り線→ログ、の順に、フォントの実寸に合わせて積み上げる
         # (ボタン行の上で必ず収まるよう、はみ出したらログの行数を減らす)
@@ -584,6 +603,105 @@ class App:
                     self.do_collect, enabled=bool(n_money))
         self.button(130, buttons_y, 118, 20, "お宝を受け取る({0})".format(n_tre) if n_tre else "お宝 なし",
                     self.do_treasures, enabled=bool(n_tre))
+
+    def do_switch_place(self, pid):
+        r = game.switch_place(self.state, pid)
+        self.show_toast(r.msg, C_GOOD if r.ok else C_BAD)
+        if r.ok:
+            self.save()
+
+    def _draw_actors(self, y):
+        s = self.state
+        pid = s["current_place"]
+        actors_here = []
+        for aid, actor in game.ACTORS.items():
+            if pid not in actor["habitat"]:
+                continue
+            astate = s["actor_states"].get(aid, {})
+            if astate.get("in_place"):
+                actors_here.append((aid, actor, astate))
+        if not actors_here:
+            return y
+        self.tx(8, y, "訪問者", C_SUB)
+        y += LINE_H + 2
+        for aid, actor, astate in actors_here:
+            name = actor["name"]
+            role_mark = "@ " if actor["role"] == "person" else "* "
+            self.tx(12, y, role_mark + name, C_TEXT)
+            gifts = actor.get("gifts", [])
+            has_gift = gifts and not astate.get("reward_given")
+            if has_gift:
+                self.tx_right(ROW_RIGHT, y, "ギフト", C_ACCENT)
+            # タップ判定を追加
+            self.hit(8, y, SCREEN_W - 16, ROW_H, lambda a=aid: self.tap_actor(a))
+            y += ROW_H
+        return y + 4
+
+    def tap_actor(self, aid):
+        s = self.state
+        actor = game.ACTORS[aid]
+        astate = s["actor_states"].get(aid, {})
+        gifts = actor.get("gifts", [])
+        has_gift = gifts and not astate.get("reward_given")
+
+        if actor["role"] == "visitor" and has_gift:
+            # キャツアイからギフトを受け取る
+            import random
+            total = sum(g[1] for g in gifts)
+            r = random.random() * total
+            cum = 0
+            chosen = gifts[0][0]
+            for item, weight in gifts:
+                cum += weight
+                if r <= cum:
+                    chosen = item
+                    break
+            # item:smartphone → smartphone
+            item_id = chosen[5:] if chosen.startswith("item:") else chosen
+            s["inventory"][item_id] = s["inventory"].get(item_id, 0) + 1
+            astate["reward_given"] = True
+            self.show_toast("{0}から{1}をもらった".format(actor["name"], game.GOODS[item_id]["name"]), C_GOOD)
+            self.save()
+        elif actor["role"] == "person" and actor.get("wants"):
+            # 取引モーダルを開く
+            self.open_trade_modal(aid)
+        else:
+            self.show_toast("{0}はこちらを見ている".format(actor["name"]), C_SUB)
+
+    def open_trade_modal(self, aid):
+        s = self.state
+        actor = game.ACTORS[aid]
+        # 所持GOODSをリストアップ
+        goods_list = [g for g in game.GOODS if s["inventory"].get(g, 0) > 0]
+        if not goods_list:
+            self.show_toast("渡せるものを持っていません", C_BAD)
+            return
+        # モーダルテキスト
+        wants = actor.get("wants", {})
+        want_text = "、".join(game.GOODS[g]["name"] for g in goods_list)
+        self.modal = {
+            "text": "{0}に何を渡しますか？\n{1}".format(actor["name"], want_text),
+            "yes": lambda: self.do_trade(aid, goods_list[0]),
+            "trade_aid": aid,
+            "trade_goods": goods_list,
+        }
+
+    def do_trade(self, aid, goods_id):
+        r = game.give(self.state, aid, goods_id)
+        self.show_toast(r.msg, C_GOOD if r.ok else C_BAD)
+        if r.ok:
+            self.save()
+            # 報酬があれば通知
+            actor = game.ACTORS[aid]
+            reward = actor.get("one_time_reward")
+            if reward:
+                if "item" in reward:
+                    name = game.GOODS[reward["item"]]["name"]
+                    self.show_toast("{0}をもらった".format(name), C_ACCENT)
+                if "creature" in reward:
+                    self.show_toast("新しい仲間が増えた", C_ACCENT)
+                if "unlocks" in reward:
+                    self.show_toast("新しい場所が開放された", C_ACCENT)
 
     def do_collect(self):
         got = game.collect(self.state)
@@ -794,12 +912,15 @@ class App:
         sub = self.sub["bag"]
         toys = list(s["owned_toys"])
         foods = [f for f in game.FOODS if s["food_stock"].get(f, 0) > 0]
+        goods = [g for g in game.GOODS if s["inventory"].get(g, 0) > 0]  # 【フェーズ3】
         if sub == 0:
             ids, empty = toys, "おもちゃを持っていません。ショップで買おう"
         elif sub == 1:
             ids, empty = foods, "エサを持っていません。ショップで買おう"
-        else:                                              # 何も押していない: 持っているものぜんぶ(おもちゃ→エサ)
-            ids, empty = toys + foods, "まだ何も持っていません。ショップで買おう"
+        elif sub == 2:  # 【フェーズ3】取引品
+            ids, empty = goods, "取引品を持っていません。キャツアイからもらおう"
+        else:  # 何も押していない: 持っているものぜんぶ
+            ids, empty = toys + foods + goods, "まだ何も持っていません。ショプで買おう"
 
         if not ids:
             self.tx(12, 46, empty, C_SUB)
@@ -813,10 +934,14 @@ class App:
                 self.tx(12, ry + 2, it["name"] + extra, C_TEXT)
                 self.tx_right(ROW_RIGHT, ry + 2, "置いてある" if placed else "置く", C_GOOD if placed else C_SUB)
                 fn = (lambda t=item_id: self.do_toggle_toy(t))
-            else:
+            elif it["kind"] == "food":
                 self.tx(12, ry + 2, "{0} ×{1}".format(it["name"], s["food_stock"][item_id]), C_TEXT)
                 self.tx_right(ROW_RIGHT, ry + 2, "置く", C_SUB)
                 fn = (lambda f=item_id: self.do_set_food(f))
+            else:  # goods 【フェーズ3】
+                self.tx(12, ry + 2, "{0} ×{1}".format(it["name"], s["inventory"][item_id]), C_TEXT)
+                self.tx_right(ROW_RIGHT, ry + 2, "持ち物", C_SUB)
+                fn = lambda: None  # 取引品は庭では使えない、アクターに渡す
             self.hit(8, ry, SCREEN_W - 16, ROW_H, fn, clip)
 
         self.list_view("bag-" + str(self.sub["bag"]), 8, 40, SCREEN_W - 16, 150, len(ids), row)
