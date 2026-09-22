@@ -266,7 +266,7 @@ def new_state(now):
         }
 
     return {
-        "s_fish": 15,
+        "s_fish": 100,
         "g_fish": 0,
         "yard": [],
         "food": None,
