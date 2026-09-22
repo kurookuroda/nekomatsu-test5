@@ -74,7 +74,8 @@ NO_LINE_START = "。、,.!?:;)]」』)…ー・!?"
 
 # ===== 小関数 =====
 def fish_text(amount, cur):
-    return "{0}のさかな{1}匹".format(game.cur_name(cur), amount)
+    name = "銀" if cur == "s" else "金"
+    return "{0}のさかな{1}匹".format(name, amount)
 
 
 def event_text(ev):
