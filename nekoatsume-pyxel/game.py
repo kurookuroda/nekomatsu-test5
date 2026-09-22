@@ -378,6 +378,22 @@ def switch_place(state, pid):
     _sync_from_current_place(state)
     return Result(True, PLACES[pid]["name"] + "に移動した", "ok")
 
+def set_food(state, food_id, force=False):
+    if not force:
+        if state.get("food"):
+            return Result(False, "すでにエサが置いてあります。置き換えますか？", "need_confirm")
+    if state["food_stock"].get(food_id, 0) <= 0:
+        return Result(False, "持ってません", "not_owned")
+    state["food_stock"][food_id] -= 1
+    state["food"] = food_id
+    state["food_remaining"] = FOODS.get(food_id, {}).get("amount", 0) if food_id else 0
+    pid = state["current_place"]
+    if pid in state["places"]:
+        state["places"][pid]["food"] = state["food"]
+        state["places"][pid]["food_remaining"] = state["food_remaining"]
+    return Result(True, FOODS[food_id]["name"] + "を置いた", "ok")
+
+
 
 # ---------------------------------------------------------------------------
 # ゲーム進行
