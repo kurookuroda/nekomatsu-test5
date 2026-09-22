@@ -528,6 +528,8 @@ def resume(state, now):
 # ---------------------------------------------------------------------------
 
 def shop_ids(state, kind, filt, sort):
+    if kind == "goods":
+        return []  # GOODS はショップで販売しない（ギフト経由のみ）
     ids = IDS_BY_KIND.get(kind, []) if kind else (
         IDS_BY_KIND.get("toy", []) + IDS_BY_KIND.get("food", [])
     )
