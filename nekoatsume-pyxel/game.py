@@ -562,7 +562,9 @@ def buy(state, item_id):
         state["owned_toys"].append(item_id)
     else:
         state["food_stock"][item_id] = state["food_stock"].get(item_id, 0) + 1
-    return Result(True, "{0}を買いました".format(it["name"]), "ok")
+    keeper_line = random.choice(catalog.SHOP_KEEPER_LINES)
+    msg = "{0}を買いました\n『{1}』".format(it["name"], keeper_line)
+    return Result(True, msg, "ok")
 
 
 def price_text(item_id):
@@ -736,6 +738,28 @@ def event_text(ev):
         aid = ev[1]
         return "{0}が来た".format(ACTORS[aid]["name"])
     return None
+
+
+def cat_state_text(cid, state):
+    """猫の外から見た描写を返す"""
+    c = state["cats"][cid]
+    fullness = c["fullness"]
+    toy = c.get("toy")
+
+    # まずおもちゃで遊んでいる描写を優先
+    if toy and c["in_yard"]:
+        descs = catalog.CAT_TOY_DESCRIPTIONS.get(toy, catalog.CAT_TOY_DESCRIPTIONS["default"])
+        return random.choice(descs)
+
+    # 満腹度に応じた描写
+    if fullness < 0.2:
+        return random.choice(catalog.CAT_STATE_DESCRIPTIONS["very_hungry"])
+    elif fullness < 0.5:
+        return random.choice(catalog.CAT_STATE_DESCRIPTIONS["hungry"])
+    elif fullness < 0.8:
+        return random.choice(catalog.CAT_STATE_DESCRIPTIONS["content"])
+    else:
+        return random.choice(catalog.CAT_STATE_DESCRIPTIONS["full"])
 
 
 # ---------------------------------------------------------------------------
