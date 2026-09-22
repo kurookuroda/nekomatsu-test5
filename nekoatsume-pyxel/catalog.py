@@ -308,3 +308,12 @@ if __name__ == "__main__":
     if tarawa and wet_food:
         print("taste_score sample (tarawa vs wet_food):",
               taste_score(tarawa[4].get("taste", {}), wet_food[5]))
+
+# ===== 店の人セリフ =====
+SHOP_KEEPER_LINES = [
+    "ナイスチョイスですね",
+    "それはいい選択ですよ",
+    "まいどあり",
+    "すてきなチョイスです",
+    "これはおすすめですよ",
+]
