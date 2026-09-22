@@ -80,9 +80,13 @@ def fish_text(amount, cur):
 def event_text(ev):
     kind = ev[0]
     if kind == "arrive":
-        return "{0}が{1}で遊び始めた".format(game.CATS[ev[1]]["name"], game.TOYS[ev[2]]["name"])
+        return "{0}が遊びに来た".format(game.CATS[ev[1]]["name"])
     if kind == "leave":
-        return "{0}が帰った(+{1}{2})".format(game.CATS[ev[1]]["name"], game.cur_name(ev[4]), ev[3])
+        return "{0}が帰った".format(game.CATS[ev[1]]["name"])
+    if kind == "actor_met":
+        return "{0}と出会った".format(game.ACTORS[ev[1]]["name"])
+    if kind == "actor_arrive":
+        return "{0}が来た".format(game.ACTORS[ev[1]]["name"])
     if kind == "treasure":
         return "{0}がお宝を置いていった!".format(game.CATS[ev[1]]["name"])
     if kind == "food_out":
