@@ -496,11 +496,17 @@ def advance(state, now):
                     yard = state["yard"]
                     toy = None
                     if yard:
-                        fav = spec.get("fav_toy")
-                        if fav and fav in yard:
-                            toy = fav
-                        else:
-                            toy = random.choice(yard)
+                        # 他の猫が使っているおもちゃは除外
+                        used_toys = {other["toy"] for other in state["cats"].values()
+                                     if other["in_yard"] and other["toy"]}
+                        available = [t for t in yard if t not in used_toys]
+                        if available:
+                            fav = spec.get("fav_toy")
+                            if fav and fav in available:
+                                toy = fav
+                            else:
+                                toy = random.choice(available)
+                        # available が空なら toy = None（おもちゃなしで来訪）
                     c["in_yard"] = True
                     if not c["met"]:
                         gain_level(state, 1, "met_new_cat")
