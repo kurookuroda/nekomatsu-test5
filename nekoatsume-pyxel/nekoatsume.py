@@ -573,23 +573,15 @@ class App:
         else:
             self.tx(8, 22, "エサがありません(もちもの→エサ)", C_BAD)
 
-        # 【フェーズ1・2】庭にいる猫の満腹度状態を表示
+        # 【フェーズ1・2】庭にいる猫の外見描写を表示
         in_yard = [(cid, s["cats"][cid]) for cid in s["cats"] if s["cats"][cid]["in_yard"]]
         y_cat_bottom = 34  # エサ表示の下
         if in_yard:
             y_cat = 34
             for cid, c in in_yard:
                 name = game.CATS[cid]["name"]
-                fullness = c["fullness"]
-                if fullness < 0.2:
-                    state_text = "お腹すいた"
-                elif fullness < 0.5:
-                    state_text = "まだ食べる"
-                elif fullness < 0.8:
-                    state_text = "満足"
-                else:
-                    state_text = "お腹いっぱい"
-                self.tx(8, y_cat, "{0}: {1}".format(name, state_text), C_SUB)
+                desc = game.cat_state_text(cid, s)
+                self.tx(8, y_cat, "{0}が{1}".format(name, desc), C_SUB)
                 y_cat += LINE_H
             y_cat_bottom = y_cat  # 猫表示の最終y位置
 
