@@ -566,9 +566,9 @@ def buy(state, item_id):
 def price_text(item_id):
     it = ITEMS[item_id]
     if it["cur"] == "s":
-        return "銀のさかな{0}匹".format(it["cost"])
+        return "銀{0}匹".format(it["cost"])
     else:
-        return "金のさかな{0}匹".format(it["cost"])
+        return "金{0}匹".format(it["cost"])
 
 
 # ---------------------------------------------------------------------------
