@@ -515,22 +515,52 @@ class App:
             self.tx_right(MSG_X + MSG_W - PAD_X, MSG_Y + MSG_H - PAD_Y - FONT_SIZE, "タップで閉じる", C_DIM)
 
     def draw_modal(self):
-        self.hits, self.areas, self.pager_regs = [], [], []     # 背後の操作は無効にする
+        self.hits, self.areas, self.pager_regs = [], [], []
         m = self.modal
-        lines = self.wrap(m["text"], 164)
-        h = len(lines) * LINE_H + 44
-        x, y, w = 24, 90, SCREEN_W - 48
-        self.draw_panel(x, y, w, h)
-        for i, line in enumerate(lines):
-            self.tx(x + 10, y + 10 + i * LINE_H, line, C_TEXT)
-        by = y + h - 26
-        self.button(x + 14, by, 80, 18, "はい", self._modal_yes)
-        self.button(x + w - 94, by, 80, 18, "いいえ", self._modal_no)
+        x, w = 24, SCREEN_W - 48
+
+        if m.get("mode") == "trade":
+            goods_list = m["goods_list"]
+            selected = m["selected"]
+            header_h = LINE_H + 12
+            item_h = len(goods_list) * ROW_H + 8
+            btn_h = 30
+            h = header_h + item_h + btn_h
+            y = max(30, (SCREEN_H - h) // 2)
+
+            self.draw_panel(x, y, w, h)
+            self.tx(x + 10, y + 8, "{0}に何を渡しますか？".format(m["actor_name"]), C_ACCENT)
+
+            iy = y + header_h
+            for i, gid in enumerate(goods_list):
+                it = game.GOODS[gid]
+                col = C_ACCENT if i == selected else C_TEXT
+                if i == selected:
+                    pyxel.rect(x + 4, iy + i * ROW_H, w - 8, ROW_H, C_PANEL)
+                self.tx(x + 10, iy + i * ROW_H + 2, it["name"], col)
+                self.hit(x + 4, iy + i * ROW_H, w - 8, ROW_H, lambda idx=i: self._select_trade_item(idx))
+
+            by = y + h - 26
+            self.button(x + 14, by, 80, 18, "渡す", self._modal_yes)
+            self.button(x + w - 94, by, 80, 18, "やめる", self._modal_no)
+        else:
+            lines = self.wrap(m["text"], 164)
+            h = len(lines) * LINE_H + 44
+            y = 90
+            self.draw_panel(x, y, w, h)
+            for i, line in enumerate(lines):
+                self.tx(x + 10, y + 10 + i * LINE_H, line, C_TEXT)
+            by = y + h - 26
+            self.button(x + 14, by, 80, 18, "はい", self._modal_yes)
+            self.button(x + w - 94, by, 80, 18, "いいえ", self._modal_no)
 
     def _modal_yes(self):
         fn = self.modal["yes"]
         self.modal = None
         fn()
+
+    def _select_trade_item(self, idx):
+        self.modal["selected"] = idx
 
     def _modal_no(self):
         self.modal = None
@@ -671,19 +701,17 @@ class App:
     def open_trade_modal(self, aid):
         s = self.state
         actor = game.ACTORS[aid]
-        # 所持GOODSをリストアップ
         goods_list = [g for g in game.GOODS if s["inventory"].get(g, 0) > 0]
         if not goods_list:
             self.show_toast("渡せるものを持っていません", C_BAD)
             return
-        # モーダルテキスト
-        wants = actor.get("wants", {})
-        want_text = "、".join(game.GOODS[g]["name"] for g in goods_list)
         self.modal = {
-            "text": "{0}に何を渡しますか？\n{1}".format(actor["name"], want_text),
-            "yes": lambda: self.do_trade(aid, goods_list[0]),
-            "trade_aid": aid,
-            "trade_goods": goods_list,
+            "mode": "trade",
+            "aid": aid,
+            "actor_name": actor["name"],
+            "goods_list": goods_list,
+            "selected": 0,
+            "yes": lambda: self.do_trade(aid, goods_list[self.modal["selected"]]),
         }
 
     def do_trade(self, aid, goods_id):
