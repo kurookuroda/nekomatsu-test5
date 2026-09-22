@@ -20,7 +20,12 @@ from ui import Typewriter, PagedText
 from audio import AudioManager
 
 
+# フェーズ1・2: ショップの種別（game.CATEGORIES はフェーズ3以降）
+SHOP_KINDS = [("toy", "おもちゃ"), ("food", "エサ")]
+
+
 class App:
+
     def __init__(self, run=True):
         pyxel.init(SCREEN_W, SCREEN_H, title="ねこあつめ", fps=30)
         pyxel.mouse(True)
@@ -647,7 +652,7 @@ class App:
 
     def _shop_strip(self):
         """種別タブ(種別が3つ以上なら ◀ ▶ でめくる)と、絞り込み・並べ替えのボタン。"""
-        cats = game.CATEGORIES
+        cats = SHOP_KINDS
         n = len(cats)
         if self.shop_kind is not None and self.shop_kind >= n:
             self.shop_kind = None
@@ -685,7 +690,7 @@ class App:
         商品をタップすると、その説明が下に開く。閉じるか、同じ商品をもう一度タップすると閉じて、一覧が広くなる。"""
         s = self.state
         self._shop_strip()
-        kind = game.CATEGORIES[self.shop_kind][0] if self.shop_kind is not None else None
+        kind = SHOP_KINDS[self.shop_kind][0] if self.shop_kind is not None else None
         ids = self._shop_ids(kind)
         index = self._shop_cache[2]
         owned_set = set(s["owned_toys"])
@@ -757,7 +762,7 @@ class App:
         if it["kind"] == "toy" and it["size"] > 1:
             info += "(庭を{0}マス使う)".format(it["size"])
         if it["kind"] == "food":
-            info += "(約{0}分もつ)".format(it["size"])
+            info += "(約{0}分もつ)".format(it["minutes"])
         return info
 
     def select_shop(self, item_id):
