@@ -20,7 +20,7 @@ from ui import Typewriter, PagedText
 from audio import AudioManager
 
 
-# フェーズ1・2: ショップの種別（game.CATEGORIES はフェーズ3以降）
+# フェーズ1・2: ショップの種別（SHOP_KINDS はフェーズ3以降）
 SHOP_KINDS = [("toy", "おもちゃ"), ("food", "エサ")]
 
 
@@ -640,7 +640,7 @@ class App:
         self.scroll.pop("shop", None)
 
     def _shop_page_kinds(self, d):
-        n = len(game.CATEGORIES)
+        n = len(SHOP_KINDS)
         self.shop_cat_off = min(max(self.shop_cat_off + d, 0), max(0, n - 2))
 
     def _shop_cycle(self, what):
