@@ -69,6 +69,8 @@ TOYS = [
 # 【タグ辞書】meat=肉, fish=魚, grain=穀物, grass=植物/草
 #   grain は現状猫の taste 側に対応キーがない(将来的に grain 好みの猫を加予定)。
 FOODS = [
+    # (id, name, cost, currency, amount, tags, desc)
+    # amount = エサの量（猫の食欲に応じて消費される）
     ("dry_food", "ドライフード", 10, "s", 300, {"meat": 0.5, "grain": 0.5},
      "ごく普通のドライフード。カリカリでシンプルな味。"),
     ("wet_food", "ウェットフード缶", 2, "g", 300, {"fish": 1.0},
