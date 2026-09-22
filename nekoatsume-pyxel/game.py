@@ -18,6 +18,18 @@ UI からはこのモジュールの関数だけを呼び出すこと。
 - meets() で出現条件判定（将来の ACTORS 用に準備）
 - 猫の初来訪時にレベルが上昇
 - CATALOG_VERSION = 4、loads() でバージョン4へのマイグレーション
+
+【フェーズ3変更点】
+- GOODS, ACTORS, PLACES を catalog から読み込み
+- state に inventory, actor_states, current_place, places を追加
+- switch_place() で場所を切り替え
+- give() で GOODS を渡し、報酬を受け取る
+- apply_reward() で報酬を適用（item/creature/stage unlocks/flags）
+- event_text() を actor 対応に拡張
+- フェーズ2互換: state['yard'] / state['food'] は current_place の場所と同期
+- CATALOG_VERSION = 5
+
+SPACE = 6  # 庭のマス数（フェーズ2互換、場所ごとの space を優先）、loads() でバージョン5へのマイグレーション
 """
 
 import collections
@@ -30,20 +42,23 @@ import catalog
 # カタログデータ(起動時に load_catalog() で読み込まれる)
 # ---------------------------------------------------------------------------
 
-CATALOG_VERSION = 4
+CATALOG_VERSION = 5
+
+SPACE = 6  # 庭のマス数（フェーズ2互換、場所ごとの space を優先）
 
 IDS_BY_KIND = {}   # {"toy": [ID, ...], "food": [ID, ...]}
 ITEMS = {}         # {ID: spec}
 TOYS = {}          # {ID: toy_spec}
 FOODS = {}         # {ID: food_spec}
 CATS = {}          # {ID: cat_spec}
+GOODS = {}         # {ID: goods_spec}
+ACTORS = {}        # {ID: actor_spec}
+PLACES = {}        # {ID: place_spec}
 
 Result = collections.namedtuple("Result", ["ok", "msg", "code"])
 
 SHOP_FILTERS = [("all", "すべて"), ("afford", "買える"), ("new", "新")]
 SHOP_SORTS = [("default", "並び"), ("price_asc", "安い"), ("price_desc", "高い")]
-
-SPACE = 6  # 庭のマス数
 
 
 # ---------------------------------------------------------------------------
@@ -84,12 +99,41 @@ def _cat(name, desc, treasure, **opts):
     }
 
 
+def _goods(name, tags, desc):
+    return {"kind": "goods", "name": name, "tags": tags, "desc": desc}
+
+
+def _actor(role, name, desc, **opts):
+    return {
+        "role": role,
+        "name": name,
+        "desc": desc,
+        "habitat": opts.get("habitat", []),
+        "requires": opts.get("requires", {}),
+        "wants": opts.get("wants", {}),
+        "gifts": opts.get("gifts", []),
+        "one_time_reward": opts.get("one_time_reward", None),
+    }
+
+
+def _place(name, space, water_feature, requires):
+    return {
+        "name": name,
+        "space": space,
+        "water_feature": water_feature,
+        "requires": requires,
+    }
+
+
 def load_catalog():
     IDS_BY_KIND.clear()
     ITEMS.clear()
     TOYS.clear()
     FOODS.clear()
     CATS.clear()
+    GOODS.clear()
+    ACTORS.clear()
+    PLACES.clear()
 
     for row in catalog.TOYS:
         TOYS[row[0]] = _toy(*row[1:])
@@ -107,6 +151,19 @@ def load_catalog():
         cid = row[0]
         opts = row[4] if len(row) > 4 else {}
         CATS[cid] = _cat(row[1], row[2], row[3], **opts)
+
+    for row in catalog.GOODS:
+        GOODS[row[0]] = _goods(row[1], row[2], row[3])
+        ITEMS[row[0]] = GOODS[row[0]]
+        IDS_BY_KIND.setdefault("goods", []).append(row[0])
+
+    for row in catalog.ACTORS:
+        aid = row[0]
+        opts = row[4] if len(row) > 4 else {}
+        ACTORS[aid] = _actor(row[1], row[2], row[3], **opts)
+
+    for row in catalog.PLACES:
+        PLACES[row[0]] = _place(row[1], row[2], row[3], row[4])
 
     catalog.validate_world_or_raise()
 
@@ -157,6 +214,29 @@ def loads(s, now):
         data.setdefault("met_actors", set())
         data["version"] = 4
 
+    if ver < 5:
+        data.setdefault("inventory", {})
+        data.setdefault("actor_states", {})
+        data.setdefault("current_place", "garden")
+        data.setdefault("places", {})
+        # フェーズ2の yard/food を garden に移行
+        if "yard" in data and "garden" not in data["places"]:
+            data["places"]["garden"] = {
+                "yard": data.get("yard", []),
+                "food": data.get("food"),
+                "food_remaining": data.get("food_remaining", 0),
+                "water": {},
+            }
+        for pid in PLACES:
+            if pid not in data["places"]:
+                data["places"][pid] = {
+                    "yard": [],
+                    "food": None,
+                    "food_remaining": 0,
+                    "water": {},
+                }
+        data["version"] = 5
+
     cats = data.setdefault("cats", {})
     for cid in CATS:
         if cid not in cats:
@@ -176,6 +256,15 @@ def loads(s, now):
 # ---------------------------------------------------------------------------
 
 def new_state(now):
+    places = {}
+    for pid in PLACES:
+        places[pid] = {
+            "yard": [],
+            "food": None,
+            "food_remaining": 0,
+            "water": {},
+        }
+
     return {
         "s_fish": 15,
         "g_fish": 0,
@@ -205,7 +294,35 @@ def new_state(now):
         "level": 0,
         "flags": set(),
         "met_actors": set(),
+        "inventory": {},
+        "actor_states": {},
+        "current_place": "garden",
+        "places": places,
     }
+
+
+# ---------------------------------------------------------------------------
+# フェーズ2互換: yard/food 同期
+# ---------------------------------------------------------------------------
+
+def _sync_from_current_place(state):
+    """current_place の場所データを state['yard'] / state['food'] に反映"""
+    pid = state["current_place"]
+    if pid in state["places"]:
+        p = state["places"][pid]
+        state["yard"] = p.get("yard", [])
+        state["food"] = p.get("food")
+        state["food_remaining"] = p.get("food_remaining", 0)
+
+
+def _sync_to_current_place(state):
+    """state['yard'] / state['food'] を current_place の場所データに反映"""
+    pid = state["current_place"]
+    if pid in state["places"]:
+        p = state["places"][pid]
+        p["yard"] = state["yard"]
+        p["food"] = state["food"]
+        p["food_remaining"] = state["food_remaining"]
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +348,7 @@ def meets(requires, state):
         elif key == "items":
             inv = set(state.get("owned_toys", []))
             inv.update(state.get("food_stock", {}).keys())
+            inv.update(state.get("inventory", {}).keys())
             if not all(item in inv for item in value):
                 return False
         elif key == "cats_met":
@@ -243,10 +361,31 @@ def meets(requires, state):
 
 
 # ---------------------------------------------------------------------------
+# 場所
+# ---------------------------------------------------------------------------
+
+def available_places(state):
+    return [pid for pid in PLACES if meets(PLACES[pid]["requires"], state)]
+
+
+def switch_place(state, pid):
+    if pid not in PLACES:
+        return Result(False, "その場所は存在しません", "no_place")
+    if pid not in available_places(state):
+        return Result(False, "まだ行けません", "locked")
+    _sync_to_current_place(state)
+    state["current_place"] = pid
+    _sync_from_current_place(state)
+    return Result(True, PLACES[pid]["name"] + "に移動した", "ok")
+
+
+# ---------------------------------------------------------------------------
 # ゲーム進行
 # ---------------------------------------------------------------------------
 
 def advance(state, now):
+    _sync_from_current_place(state)
+
     last = state.get("last_advance", now)
     elapsed = now - last
     ticks = min(int(elapsed // 60), 60)
@@ -256,10 +395,37 @@ def advance(state, now):
     visits = 0
     bonus_treasure = None
 
+    pid = state["current_place"]
+    place = PLACES.get(pid)
+    space = place["space"] if place else 6
+
     food_id = state.get("food")
     food_tags = FOODS.get(food_id, {}).get("tags", {}) if food_id else {}
 
+    # アクター出現判定
+    for aid, actor in ACTORS.items():
+        if pid not in actor["habitat"]:
+            continue
+        if not meets(actor["requires"], state):
+            continue
+        astate = state["actor_states"].setdefault(aid, {
+            "met": False, "in_place": False, "timer": 0, "reward_given": False,
+        })
+        if not astate["met"]:
+            astate["met"] = True
+            state["met_actors"].add(aid)
+            events.append(("actor_met", aid))
+        if not astate["in_place"]:
+            astate["in_place"] = True
+            astate["timer"] = 0
+            events.append(("actor_arrive", aid))
+
     for _ in range(ticks):
+        # ---- アクタータイマー ----
+        for aid, astate in state["actor_states"].items():
+            if astate.get("in_place"):
+                astate["timer"] = astate.get("timer", 0) + 1
+
         # ---- エサの減り ----
         if food_id and state["food_remaining"] > 0:
             eaters = [cid for cid, c in state["cats"].items() if c["in_yard"]]
@@ -297,7 +463,6 @@ def advance(state, now):
                 c["in_yard"] = False
                 c["toy"] = None
                 c["time_in_yard"] = 0
-                # 猫が帰るときに銀のさかなを置いていく（基本1〜3匹、友好度で増加）
                 amount = random.randint(1, 3)
                 if spec["traits"]["friendly"] > 0.6:
                     amount += 1
@@ -310,11 +475,13 @@ def advance(state, now):
         # ---- 猫の来訪 ----
         if food_id and state["food_remaining"] > 0:
             used = space_used(state)
-            free_space = SPACE - used
+            free_space = space - used
 
             for cid, spec in CATS.items():
                 c = state["cats"][cid]
                 if c["in_yard"]:
+                    continue
+                if pid not in spec["habitat"]:
                     continue
 
                 base_chance = spec["entry_chance"]
@@ -344,9 +511,12 @@ def advance(state, now):
                     free_space -= 1
                     events.append(("arrive", cid))
 
+    _sync_to_current_place(state)
+
     return {"ticks": ticks, "events": events, "visits": visits,
             "bonus_treasure": bonus_treasure,
-            "first_visits": [cid for cid, c in state["cats"].items() if c["met"] and c["total_time"] == 0 and c["time_in_yard"] == 0]}
+            "first_visits": [cid for cid, c in state["cats"].items()
+                             if c["met"] and c["total_time"] == 0 and c["time_in_yard"] == 0]}
 
 
 def resume(state, now):
@@ -395,7 +565,10 @@ def buy(state, item_id):
 
 def price_text(item_id):
     it = ITEMS[item_id]
-    return "{0}{1}".format(it["cost"], "s" if it["cur"] == "s" else "g")
+    if it["cur"] == "s":
+        return "銀のさかな{0}匹".format(it["cost"])
+    else:
+        return "金のさかな{0}匹".format(it["cost"])
 
 
 # ---------------------------------------------------------------------------
@@ -403,29 +576,38 @@ def price_text(item_id):
 # ---------------------------------------------------------------------------
 
 def space_used(state):
+    _sync_from_current_place(state)
     return sum(TOYS[t]["size"] for t in state["yard"])
 
 
 def place_toy(state, toy_id):
+    _sync_from_current_place(state)
     if toy_id in state["yard"]:
         return Result(False, "すでに置いてあります", "already_placed")
-    if space_used(state) + TOYS[toy_id]["size"] > SPACE:
-        return Result(False, "庭のスペースが足りません", "no_space")
+    pid = state["current_place"]
+    place = PLACES.get(pid)
+    space = place["space"] if place else 6
+    if space_used(state) + TOYS[toy_id]["size"] > space:
+        return Result(False, "スペースが足りません", "no_space")
     state["yard"].append(toy_id)
-    return Result(True, "{0}を庭に置きました".format(TOYS[toy_id]["name"]), "ok")
+    _sync_to_current_place(state)
+    return Result(True, "{0}を置きました".format(TOYS[toy_id]["name"]), "ok")
 
 
 def remove_toy(state, toy_id):
+    _sync_from_current_place(state)
     if toy_id not in state["yard"]:
-        return Result(False, "庭にありません", "not_placed")
+        return Result(False, "ありません", "not_placed")
     state["yard"].remove(toy_id)
     for c in state["cats"].values():
         if c["toy"] == toy_id:
             c["toy"] = None
+    _sync_to_current_place(state)
     return Result(True, "{0}を片付けました".format(TOYS[toy_id]["name"]), "ok")
 
 
 def set_food(state, food_id, force=False):
+    _sync_from_current_place(state)
     if state["food_stock"].get(food_id, 0) <= 0:
         return Result(False, "持ってません", "not_owned")
     if state["food"] and not force:
@@ -435,6 +617,7 @@ def set_food(state, food_id, force=False):
     state["food_stock"][food_id] -= 1
     if state["food_stock"][food_id] <= 0:
         del state["food_stock"][food_id]
+    _sync_to_current_place(state)
     return Result(True, "{0}を置きました".format(FOODS[food_id]["name"]), "ok")
 
 
@@ -459,6 +642,67 @@ def collect_treasures(state):
 
 
 # ---------------------------------------------------------------------------
+# 取引
+# ---------------------------------------------------------------------------
+
+def give(state, actor_id, goods_id):
+    if actor_id not in ACTORS:
+        return Result(False, "その人はいません", "no_actor")
+    if goods_id not in GOODS:
+        return Result(False, "その品物はありません", "no_goods")
+    if state["inventory"].get(goods_id, 0) <= 0:
+        return Result(False, "持っていません", "not_owned")
+
+    actor = ACTORS[actor_id]
+    astate = state["actor_states"].get(actor_id, {})
+
+    if not astate.get("in_place"):
+        return Result(False, "今はいません", "not_here")
+
+    # wants チェック
+    goods_tags = GOODS[goods_id].get("tags", {})
+    wants = actor.get("wants", {})
+    if wants:
+        match = False
+        for tag, threshold in wants.items():
+            if goods_tags.get(tag, 0) >= threshold:
+                match = True
+                break
+        if not match:
+            return Result(False, "これは不要のようだ", "not_wanted")
+
+    # 渡す
+    state["inventory"][goods_id] -= 1
+    if state["inventory"][goods_id] <= 0:
+        del state["inventory"][goods_id]
+
+    # 報酬
+    reward = actor.get("one_time_reward")
+    if reward and not astate.get("reward_given"):
+        astate["reward_given"] = True
+        apply_reward(state, reward)
+        return Result(True, "{0}に{1}を渡した".format(actor["name"], GOODS[goods_id]["name"]), "rewarded")
+
+    return Result(True, "{0}に{1}を渡した".format(actor["name"], GOODS[goods_id]["name"]), "ok")
+
+
+def apply_reward(state, reward):
+    if not reward:
+        return
+    if "item" in reward:
+        item_id = reward["item"]
+        state["inventory"][item_id] = state["inventory"].get(item_id, 0) + 1
+    if "creature" in reward:
+        creature = reward["creature"]
+        state["flags"].add("creature_" + creature)
+    if "unlocks" in reward:
+        unlocks = reward["unlocks"]
+        state["flags"].add("unlocked_" + unlocks)
+    if "flag" in reward:
+        state["flags"].add(reward["flag"])
+
+
+# ---------------------------------------------------------------------------
 # クエリ
 # ---------------------------------------------------------------------------
 
@@ -475,12 +719,20 @@ def met_list(state):
 # ---------------------------------------------------------------------------
 
 def event_text(ev):
-    typ, cid = ev[0], ev[1]
-    name = CATS[cid]["name"]
-    if typ == "arrive":
-        return "{0}が遊びに来た".format(name)
-    if typ == "leave":
-        return "{0}が帰った".format(name)
+    typ = ev[0]
+    if typ in ("arrive", "leave"):
+        cid = ev[1]
+        name = CATS[cid]["name"]
+        if typ == "arrive":
+            return "{0}が遊びに来た".format(name)
+        if typ == "leave":
+            return "{0}が帰った".format(name)
+    if typ == "actor_met":
+        aid = ev[1]
+        return "{0}と出会った".format(ACTORS[aid]["name"])
+    if typ == "actor_arrive":
+        aid = ev[1]
+        return "{0}が来た".format(ACTORS[aid]["name"])
     return None
 
 
