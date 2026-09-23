@@ -1037,7 +1037,13 @@ class App:
         こうすると、あとで明かされても行の数や位置が変わらない。
         【フェーズ1・2】性別・満腹度・性格を追加（数値は見せず、言葉で表現）。"""
         spec, c = game.CATS[cid], self.state["cats"][cid]
-        now = "{0}で遊んでいる".format(game.TOYS[c["toy"]]["name"]) if c["in_yard"] else "今はいない"
+        if c["in_yard"]:
+            if c["toy"]:
+                now = "{0}で遊んでいる".format(game.TOYS[c["toy"]]["name"])
+            else:
+                now = "のんびりしている"
+        else:
+            now = "今はいない"
         treasure = spec["treasure"] if c["given_treasure"] else "？" * len(spec["treasure"])
 
         # 性別マーク
