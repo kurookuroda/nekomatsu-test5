@@ -1,795 +1,1100 @@
 """
-ねこあつめ Pyxel 版 ― ゲームルール
+ねこあつめ Pyxel 版(文字だけの UI)
 
-catalog.py のデータを読み込み、状態(state)を操作する関数を提供します。
-UI からはこのモジュールの関数だけを呼び出すこと。
+    実行:  pyxel run nekoatsume.py      (または python nekoatsume.py)
+    Web :  https://kitao.github.io/pyxel/web/launcher/?run=<ユーザー名>.<リポジトリ名>.nekoatsume
 
-【フェーズ1変更】
-- _food() に tags 引数を追加（エサの好みタグ）
-- _cat() で個性辞書を正規化（sex/traits/taste/affinity/habitat の既定値補完）
-- 猫の状態 fullness/trust/happiness を追加
-- advance() で taste_score を使って来訪率を補正
-- エサの減り方を「時間で1ずつ」から「庭にいる猫が食べた分」に変更
-- CATALOG_VERSION = 3、loads() でバージョン3へのマイグレーション
-
-【フェーズ2変更点】
-- 隠れレベル(level)・フラグ(flags)・出会った人々(met_actors)を追加
-- gain_level() で静かな進行を管理（数字は見せない）
-- meets() で出現条件判定（将来の ACTORS 用に準備）
-- 猫の初来訪時にレベルが上昇
-- CATALOG_VERSION = 4、loads() でバージョン4へのマイグレーション
-
-【フェーズ3変更点】
-- GOODS, ACTORS, PLACES を catalog から読み込み
-- state に inventory, actor_states, current_place, places を追加
-- switch_place() で場所を切り替え
-- give() で GOODS を渡し、報酬を受け取る
-- apply_reward() で報酬を適用（item/creature/stage unlocks/flags）
-- event_text() を actor 対応に拡張
-- フェーズ2互換: state['yard'] / state['food'] は current_place の場所と同期
-- CATALOG_VERSION = 5
-
-SPACE = 6  # 庭のマス数（フェーズ2互換、場所ごとの space を優先）、loads() でバージョン5へのマイグレーション
+操作は「タップ / クリック」が基本。リストはドラッグ(ホイール・↑↓キーも可)でスクロールし、右端のバーをつかむと一気に動かせる。
+文章は1文字ずつ出る。枠に収まらないときはページに分かれ、▼ が点滅したらタップ(Enter / Space)で次へ。
+1〜5 キーで下のタブを切り替えられる。ゲームのルールは game.py、アイテムと猫のデータは catalog.py にある。
 """
 
-import collections
-import json
-import random
+import os
+import time
 
-import catalog
+import pyxel
 
-# ---------------------------------------------------------------------------
-# カタログデータ(起動時に load_catalog() で読み込まれる)
-# ---------------------------------------------------------------------------
-
-CATALOG_VERSION = 5
-
-SPACE = 6  # 庭のマス数（フェーズ2互換、場所ごとの space を優先）
-
-IDS_BY_KIND = {}   # {"toy": [ID, ...], "food": [ID, ...]}
-ITEMS = {}         # {ID: spec}
-TOYS = {}          # {ID: toy_spec}
-FOODS = {}         # {ID: food_spec}
-CATS = {}          # {ID: cat_spec}
-GOODS = {}         # {ID: goods_spec}
-ACTORS = {}        # {ID: actor_spec}
-PLACES = {}        # {ID: place_spec}
-
-Result = collections.namedtuple("Result", ["ok", "msg", "code"])
-
-SHOP_FILTERS = [("all", "すべて"), ("afford", "買える"), ("new", "新")]
-SHOP_SORTS = [("default", "並び"), ("price_asc", "安い"), ("price_desc", "高い")]
+import game
+from config import *
+from ui import Typewriter, PagedText
+from audio import AudioManager
 
 
-# ---------------------------------------------------------------------------
-# カタログ読み込み
-# ---------------------------------------------------------------------------
-
-def _toy(name, cost, cur, size, desc):
-    return {"kind": "toy", "name": name, "cost": cost, "cur": cur,
-            "size": size, "desc": desc}
+# フェーズ1・2: ショップの種別（SHOP_KINDS はフェーズ3以降）
+SHOP_KINDS = [("toy", "おもちゃ"), ("food", "エサ"), ("goods", "取引品")]
 
 
-def _food(name, cost, cur, minutes, tags, desc):
-    return {"kind": "food", "name": name, "cost": cost, "cur": cur,
-            "minutes": minutes, "tags": tags, "desc": desc}
+class App:
 
+    def __init__(self, run=True):
+        pyxel.init(SCREEN_W, SCREEN_H, title="ねこあつめ", fps=30)
+        pyxel.mouse(True)
+        self.font = pyxel.Font(FONT_PATH, FONT_SIZE) if os.path.exists(FONT_PATH) else None
+        self.clock = time.time
 
-def _cat(name, desc, treasure, **opts):
-    traits = opts.get("traits", {})
-    normalized_traits = {
-        "appetite": traits.get("appetite", catalog.DEFAULT_TRAITS["appetite"]),
-        "friendly": traits.get("friendly", catalog.DEFAULT_TRAITS["friendly"]),
-        "wary": traits.get("wary", catalog.DEFAULT_TRAITS["wary"]),
-    }
-    return {
-        "name": name,
-        "desc": desc,
-        "treasure": treasure,
-        "sex": opts.get("sex", "m"),
-        "traits": normalized_traits,
-        "taste": opts.get("taste", {}),
-        "affinity": opts.get("affinity", {}),
-        "habitat": opts.get("habitat", ["garden"]),
-        "strength": opts.get("strength", 5),
-        "entry_chance": opts.get("entry_chance", 0.1),
-        "time_limit": opts.get("time_limit", 30),
-        "fav_toy": opts.get("fav_toy", None),
-        "exclusive": opts.get("exclusive", False),
-    }
+        # 画面の状態
+        self.screen = "yard"
+        self.sub = {"bag": None}               # もちものの種別タブ。None=何も押していない(すべて) 0=おもちゃ 1=エサ
+        self.selected = {"shop": None, "cats": None}
+        self.scroll = {}
+        self.log = []                          # [{"full": 折り返し済みテキスト, "revealed": int}]
+        self.log_timer = 0
+        self.toast = None                      # {"col":..., "frames":...}
+        self.toast_tw = Typewriter()
+        self.cat_pager = PagedText()           # 図鑑の猫のプロフィール
+        self.shop_pager = PagedText()          # ショップの商品説明
+        self.help_pager = PagedText()          # ヘルプ
+        self.message = None                    # 長いメッセージのダイアログ {"pager": PagedText}
+        self.pager_regs = []                   # このフレームに描いたページ送りの枠 [(pager, x, y, w, h)]
+        self.modal = None                      # {"text":..., "yes": fn}
+        self.hits = []
+        self.areas = []
+        self.press = None
+        # ショップの表示条件(種別・絞り込み・並べ替え)
+        self.shop_kind = None                  # None=何も押していない(すべての商品)。押すとその種別だけになる
+        self.shop_cat_off = 0                  # 種別タブが多いとき、先頭に出す種別の番号
+        self.shop_filter = 0
+        self.shop_sort = 0
+        self._shop_cache = (None, [], {})      # (条件, 商品ID, 商品ID→行番号)
+        self._shop_reveal = None               # 説明を開いた商品(一覧が狭くなったとき、見える位置へ寄せる)
+        self.shop_panel_y = None               # 説明パネルの上端(閉じているとき None)。説明の長さに合わせて高さが決まる
+        self.audio = AudioManager()
+        self.audio_unlocked = False
 
+        self._init_save()
+        self.state = self._load()
+        self._on_launch()
 
-def _goods(name, tags, desc):
-    return {"kind": "goods", "name": name, "tags": tags, "desc": desc}
+        if run:
+            pyxel.run(self.update, self.draw)
 
+    # ------------------------------------------------------------ 音(委譲)
+    def _play_type_sound(self, ch):
+        self.audio.play_type_sound(ch)
 
-def _actor(role, name, desc, **opts):
-    return {
-        "role": role,
-        "name": name,
-        "desc": desc,
-        "habitat": opts.get("habitat", []),
-        "requires": opts.get("requires", {}),
-        "wants": opts.get("wants", {}),
-        "gifts": opts.get("gifts", []),
-        "one_time_reward": opts.get("one_time_reward", None),
-    }
+    def _play_meow(self, cat_id):
+        self.audio.play_meow(cat_id)
 
+    # ------------------------------------------------------------ 保存
+    def _init_save(self):
+        self.save_path = None
+        try:
+            base = os.environ.get("NEKOATSUME_SAVE_DIR") or pyxel.user_data_dir(VENDOR, APP_NAME)
+            os.makedirs(base, exist_ok=True)
+            self.save_path = os.path.join(base, SAVE_NAME)
+        except Exception:
+            self.save_path = None
 
-def _place(name, space, water_feature, requires):
-    return {
-        "name": name,
-        "space": space,
-        "water_feature": water_feature,
-        "requires": requires,
-    }
+    def _load(self):
+        now = self.clock()
+        self.startup_notice = ""
+        if self.save_path and os.path.exists(self.save_path):
+            try:
+                with open(self.save_path, encoding="utf-8") as f:
+                    return game.loads(f.read(), now)
+            except Exception:
+                try:
+                    os.replace(self.save_path, self.save_path + ".bad")
+                except OSError:
+                    pass
+                self.startup_notice = "セーブデータが読めなかったので、新しく始めます"
+        return game.new_state(now)
 
+    def save(self):
+        if not self.save_path:
+            return
+        try:
+            tmp = self.save_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(game.dumps(self.state))
+            os.replace(tmp, self.save_path)
+        except OSError:
+            self.save_path = None
+            self.show_toast("セーブできませんでした", C_BAD)
 
-def load_catalog():
-    IDS_BY_KIND.clear()
-    ITEMS.clear()
-    TOYS.clear()
-    FOODS.clear()
-    CATS.clear()
-    GOODS.clear()
-    ACTORS.clear()
-    PLACES.clear()
+    def _on_launch(self):
+        rep = game.resume(self.state, self.clock())
+        if self.startup_notice:
+            self.show_toast(self.startup_notice, C_BAD)
+        if rep["ticks"] >= 2:
+            self.add_log("離れていた間に{0}分たちました。猫が{1}回遊びに来たよ".format(rep["ticks"], rep["visits"]))
+        if rep["bonus_treasure"]:
+            self.add_log("{0}がお宝を持ってきた!".format(game.CATS[rep["bonus_treasure"]]["name"]))
+        # 【フェーズ2】離れている間に初来訪した猫
+        for cid in rep.get("first_visits", []):
+            self.add_log("離れている間に、はじめて {0} が来た！".format(game.CATS[cid]["name"]))
+        self._notice_pending()
+        self.save()
 
-    for row in catalog.TOYS:
-        TOYS[row[0]] = _toy(*row[1:])
-        ITEMS[row[0]] = TOYS[row[0]]
-        IDS_BY_KIND.setdefault("toy", []).append(row[0])
+    def _notice_pending(self):
+        if self.state["pending_money"] or self.state["pending_treasures"]:
+            self.show_toast("さかなやお宝が届いています。「にわ」で受け取ろう", C_ACCENT)
 
-    for row in catalog.FOODS:
-        tags = row[5] if len(row) > 5 else {}
-        desc = row[6] if len(row) > 6 else ""
-        FOODS[row[0]] = _food(row[1], row[2], row[3], row[4], tags, desc)
-        ITEMS[row[0]] = FOODS[row[0]]
-        IDS_BY_KIND.setdefault("food", []).append(row[0])
+    # ------------------------------------------------------------ 文字の補助
+    def tw(self, s):
+        return self.font.text_width(s) if self.font else len(s) * pyxel.FONT_WIDTH
 
-    for row in catalog.CATS:
-        cid = row[0]
-        opts = row[4] if len(row) > 4 else {}
-        CATS[cid] = _cat(row[1], row[2], row[3], **opts)
+    def tx(self, x, y, s, col=C_TEXT):
+        pyxel.text(x, y, s, col, self.font)
 
-    for row in catalog.GOODS:
-        GOODS[row[0]] = _goods(row[1], row[2], row[3])
-        ITEMS[row[0]] = GOODS[row[0]]
-        IDS_BY_KIND.setdefault("goods", []).append(row[0])
+    def tx_right(self, right_x, y, s, col=C_TEXT):
+        self.tx(right_x - self.tw(s), y, s, col)
 
-    for row in catalog.ACTORS:
-        aid = row[0]
-        opts = row[4] if len(row) > 4 else {}
-        ACTORS[aid] = _actor(row[1], row[2], row[3], **opts)
+    def fit(self, s, max_w, fallback=None):
+        if self.tw(s) <= max_w:
+            return s
+        return fallback if fallback is not None else s[:max(1, len(s) * max_w // max(1, self.tw(s)) - 1)] + "…"
 
-    for row in catalog.PLACES:
-        PLACES[row[0]] = _place(row[1], row[2], row[3], row[4])
+    def wrap(self, s, max_w):
+        """幅 max_w で折り返す。行頭に来てはいけない「。」「、」などは、1文字分だけ行末にぶら下げる。
+        そのため、行の幅は最大で max_w + FONT_SIZE になる(呼ぶ側は、その分の余白を見込んで max_w を決める)。"""
+        lines = []
+        for para in s.split("\n"):
+            line = ""
+            for ch in para:
+                hang = ch in NO_LINE_START and self.tw(line + ch) <= max_w + FONT_SIZE
+                if self.tw(line + ch) > max_w and line and not hang:
+                    lines.append(line)
+                    line = ch
+                else:
+                    line += ch
+            lines.append(line)
+        return lines
 
-    catalog.validate_world_or_raise()
+    def add_log(self, text, cat=None):
+        """cat(猫ID)を渡すと、その行が出はじめるときに、その猫の鳴き声を鳴らす(猫が去るとき)。"""
+        full = "\n".join(self.wrap(text, SCREEN_W - 32))
+        self.log.append({"full": full, "revealed": 0, "cat": cat})
+        self.log = self.log[-LOG_MAX:]
 
+    def _advance_log_typing(self):
+        """一番古い「まだ出し終えていない」できごとだけを、1文字ずつ進める(順番に表示される)。"""
+        for entry in self.log:
+            if entry["revealed"] >= len(entry["full"]):
+                continue
+            self.log_timer += 1
+            if self.log_timer >= Typewriter.INTERVAL:
+                self.log_timer = 0
+                full = entry["full"]
+                while entry["revealed"] < len(full) and full[entry["revealed"]] == "\n":
+                    entry["revealed"] += 1
+                if entry["revealed"] < len(full):
+                    if entry["revealed"] == 0 and entry.get("cat") is not None:
+                        self._play_meow(entry["cat"])
+                    ch = full[entry["revealed"]]
+                    entry["revealed"] += 1
+                    self._play_type_sound(ch)
+            break
 
-# ---------------------------------------------------------------------------
-# セーブ/ロード
-# ---------------------------------------------------------------------------
+    def _log_typing(self):
+        return any(e["revealed"] < len(e["full"]) for e in self.log)
 
-def _sanitize(state):
-    if isinstance(state, dict):
-        return {k: _sanitize(v) for k, v in state.items()}
-    if isinstance(state, list):
-        return [_sanitize(v) for v in state]
-    if isinstance(state, set):
-        return ["__set__"] + list(state)
-    return state
+    def _skip_log(self):
+        for e in self.log:
+            e["revealed"] = len(e["full"])
 
+    def visible_log(self, max_lines):
+        """新しい順に、行数に収まる分だけ「一文まるごと」取り出す(途中で切れた文は出さない)。
+        まだ表示の順番が回ってきていない(revealed==0)できごとは出さない。"""
+        out = []
+        for entry in reversed(self.log):
+            if entry["revealed"] == 0:
+                continue
+            lines = entry["full"][:entry["revealed"]].split("\n")
+            if len(out) + len(lines) > max_lines:
+                break
+            out = lines + out
+        return out
 
-def _deserialize(obj):
-    if isinstance(obj, dict):
-        return {k: _deserialize(v) for k, v in obj.items()}
-    if isinstance(obj, list) and obj and obj[0] == "__set__":
-        return set(obj[1:])
-    if isinstance(obj, list):
-        return [_deserialize(v) for v in obj]
-    return obj
+    def show_toast(self, text, col=C_TEXT):
+        """短い知らせは画面の上にさっと出す。長いときはページ送りのダイアログにする(はみ出さないように)。"""
+        lines = self.wrap(text, SCREEN_W - 36)
+        if len(lines) > TOAST_MAX_LINES:
+            self.show_message(text, col)
+            return
+        self.toast = {"col": col, "frames": TOAST_FRAMES}
+        self.toast_tw.set_text("\n".join(lines))
 
+    def show_message(self, text, col=C_TEXT):
+        """長い文章のダイアログ。ページに分け、▼ が点滅したらタップで進み、最後のページでタップすると閉じる。"""
+        pager = PagedText()
+        pager.set(("msg", text), [(text, col)], self.wrap, MSG_W, MSG_H)
+        self.message = {"pager": pager}
+        self.toast = None
 
-def dumps(state):
-    return json.dumps(_sanitize({**state, "version": CATALOG_VERSION}))
+    def _advance_message(self):
+        if not self.message["pager"].advance():
+            self.message = None
 
+    # ------------------------------------------------------------ 入力
+    def _pointer(self):
+        """(x, y, 押した瞬間, 押している, 離した瞬間, ホイール)。テストでは差し替える。"""
+        return (pyxel.mouse_x, pyxel.mouse_y,
+                pyxel.btnp(pyxel.MOUSE_BUTTON_LEFT), pyxel.btn(pyxel.MOUSE_BUTTON_LEFT),
+                pyxel.btnr(pyxel.MOUSE_BUTTON_LEFT), pyxel.mouse_wheel)
 
-def loads(s, now):
-    data = json.loads(s)
-    data = _deserialize(data)
-    ver = data.get("version", 1)
+    def _keys(self):
+        """キーボード入力(押した瞬間の集合)。テストでは差し替える。"""
+        keys = set()
+        for name in ("KEY_1", "KEY_2", "KEY_3", "KEY_4", "KEY_5", "KEY_UP", "KEY_DOWN",
+                     "KEY_PAGEUP", "KEY_PAGEDOWN", "KEY_HOME", "KEY_END", "KEY_RETURN", "KEY_SPACE",
+                     "KEY_LEFT", "KEY_RIGHT", "KEY_BACKSPACE"):
+            if hasattr(pyxel, name) and pyxel.btnp(getattr(pyxel, name)):
+                keys.add(name)
+        return keys
 
-    if ver < 3:
-        for cid, c in data.get("cats", {}).items():
-            c.setdefault("fullness", 0.5)
-            c.setdefault("trust", 0.0)
-            c.setdefault("happiness", 0.5)
-        data["version"] = 3
+    def _area_at(self, x, y):
+        for area in reversed(self.areas):
+            _key, ax, ay, aw, ah, _maxs = area
+            if ax <= x < ax + aw and ay <= y < ay + ah:
+                return area
+        return None
 
-    if ver < 4:
-        data.setdefault("level", 0)
-        data.setdefault("flags", set())
-        data.setdefault("met_actors", set())
-        data["version"] = 4
+    def _scroll_by(self, area, dy):
+        key, _ax, _ay, _aw, _ah, maxs = area
+        self.scroll[key] = min(max(self.scroll.get(key, 0) + dy, 0), maxs)
 
-    if ver < 5:
-        data.setdefault("inventory", {})
-        data.setdefault("actor_states", {})
-        data.setdefault("current_place", "garden")
-        data.setdefault("places", {})
-        # フェーズ2の yard/food を garden に移行
-        if "yard" in data and "garden" not in data["places"]:
-            data["places"]["garden"] = {
-                "yard": data.get("yard", []),
-                "food": data.get("food"),
-                "food_remaining": data.get("food_remaining", 0),
-                "water": {},
-            }
-        for pid in PLACES:
-            if pid not in data["places"]:
-                data["places"][pid] = {
-                    "yard": [],
-                    "food": None,
-                    "food_remaining": 0,
-                    "water": {},
-                }
-        data["version"] = 5
+    def _drag_bar(self, area, y):
+        """スクロールバーをつかんで動かす(押した位置にバーが来る)。猫や商品が何百あっても、すぐ目的の場所へ行ける。"""
+        key, _ax, ay, _aw, ah, maxs = area
+        total = maxs + ah
+        thumb = max(10, ah * ah // total)
+        ratio = (y - ay - thumb / 2) / max(1, ah - thumb)
+        self.scroll[key] = int(min(max(ratio, 0), 1) * maxs)
 
-    cats = data.setdefault("cats", {})
-    for cid in CATS:
-        if cid not in cats:
-            cats[cid] = new_state(0)["cats"][cid]
-    for cid in list(cats):
-        if cid not in CATS:
-            del cats[cid]
+    def handle_input(self):
+        mx, my, pressed, held, released, wheel = self._pointer()
+        if pressed:
+            area = self._area_at(mx, my)
+            bar = bool(area and area[5] > 0 and mx >= area[1] + area[3] - BAR_HIT_W)
+            self.press = {"y": my, "area": area, "off": self.scroll.get(area[0], 0) if area else 0,
+                          "moved": bar, "bar": bar}
+            if bar:
+                self._drag_bar(area, my)
+        elif self.press and held and self.press["area"]:
+            p = self.press
+            if p["bar"]:
+                self._drag_bar(p["area"], my)
+            elif p["moved"] or abs(my - p["y"]) > 4:
+                p["moved"] = True
+                key, _ax, _ay, _aw, _ah, maxs = p["area"]
+                self.scroll[key] = min(max(p["off"] + p["y"] - my, 0), maxs)
+        if released and self.press:
+            moved = self.press["moved"]
+            self.press = None
+            if not moved:
+                self._on_tap(mx, my)
+        if wheel:
+            area = self._area_at(mx, my)
+            if area:
+                self._scroll_by(area, -wheel * ROW_H)
 
-    if "last_advance" not in data:
-        data["last_advance"] = now
+        keys = self._keys()
+        if self.message:
+            if keys & {"KEY_RETURN", "KEY_SPACE", "KEY_RIGHT"}:
+                self._advance_message()
+            elif keys & {"KEY_LEFT", "KEY_BACKSPACE"}:
+                self.message["pager"].prev_page()
+            return
+        for i, (name, _label) in enumerate(TABS):
+            if "KEY_%d" % (i + 1) in keys:
+                self.goto(name)
+        if keys & {"KEY_RETURN", "KEY_SPACE", "KEY_RIGHT"}:
+            self._advance_key()
+        if keys & {"KEY_LEFT", "KEY_BACKSPACE"}:
+            self._back_key()
+        if self.areas:
+            area = self.areas[0]
+            page = max(1, area[4] // ROW_H) * ROW_H
+            for name, dy in (("KEY_UP", -ROW_H), ("KEY_DOWN", ROW_H), ("KEY_PAGEUP", -page),
+                             ("KEY_PAGEDOWN", page), ("KEY_HOME", -10 ** 9), ("KEY_END", 10 ** 9)):
+                if name in keys:
+                    self._scroll_by(area, dy)
 
-    return data
+    def _back_rect_hit(self, x, y):
+        """「◀」(前のページへ)がタップされたなら、そのページ送りを返す。"""
+        for pager in reversed(self._visible_pagers()):
+            r = pager.back_rect
+            if r and pager.has_prev and r[0] <= x < r[0] + r[2] and r[1] <= y < r[1] + r[3]:
+                return pager
+        return None
 
+    def _on_tap(self, x, y):
+        """タップの振り分け。◀(前のページ) > 長いメッセージ > 文字送り中(全部出す) > ページ送りの枠(次のページ) > ふつうのボタン"""
+        back = self._back_rect_hit(x, y)
+        if back:
+            back.prev_page()
+            return
+        if self.message:
+            self._advance_message()
+            return
+        if self._typing_active():
+            self._skip_typing()
+            return
+        for pager, rx, ry, rw, rh in reversed(self.pager_regs):
+            if rx <= x < rx + rw and ry <= y < ry + rh and pager.has_next:
+                pager.next_page()
+                return
+        self.tap(x, y)
 
-# ---------------------------------------------------------------------------
-# 状態の初期化
-# ---------------------------------------------------------------------------
+    def _back_key(self):
+        """←キー / Backspace: 前のページへ。"""
+        for pager in reversed(self._visible_pagers()):
+            if pager.has_prev:
+                pager.prev_page()
+                return
 
-def new_state(now):
-    places = {}
-    for pid in PLACES:
-        places[pid] = {
-            "yard": [],
-            "food": None,
-            "food_remaining": 0,
-            "water": {},
+    def _advance_key(self):
+        """Enter / Space: タップと同じ(位置は問わない)。"""
+        if self._typing_active():
+            self._skip_typing()
+            return
+        for pager, _x, _y, _w, _h in reversed(self.pager_regs):
+            if pager.has_next:
+                pager.next_page()
+                return
+
+    def tap(self, x, y):
+        for hx, hy, hw, hh, fn, clip in reversed(self.hits):
+            if hx <= x < hx + hw and hy <= y < hy + hh:
+                if clip and not (clip[0] <= x < clip[0] + clip[2] and clip[1] <= y < clip[1] + clip[3]):
+                    continue
+                fn()
+                return
+
+    def goto(self, name):
+        if name != self.screen:
+            self.screen = name
+            self.hits, self.areas, self.pager_regs, self.press = [], [], [], None
+            if name == "help":
+                self.help_pager.key = None          # ヘルプは開くたびに、はじめから読み上げる
+
+    # ------------------------------------------------------------ 一文字ずつ表示(タイプライター)
+    def _visible_pagers(self):
+        pagers = [p for p, _x, _y, _w, _h in self.pager_regs]
+        if self.message:
+            pagers.append(self.message["pager"])
+        return pagers
+
+    def _typing_active(self):
+        return (self._log_typing() or not self.toast_tw.done
+                or any(p.typing for p in self._visible_pagers()))
+
+    def _skip_typing(self):
+        self._skip_log()
+        self.toast_tw.skip()
+        for p in self._visible_pagers():
+            p.skip()
+
+    # ------------------------------------------------------------ 更新
+    def update(self):
+        # 最初のタップで AudioContext を unlock（ブラウザ対策）
+        if not self.audio_unlocked:
+            if pyxel.btnp(pyxel.MOUSE_BUTTON_LEFT) or self._keys():
+                self.audio_unlocked = True
+                pyxel.play(3, self.audio.snd_talk_space)  # 無音に近い短い音で unlock
+
+        rep = game.advance(self.state, self.clock())
+        if rep["ticks"]:
+            if rep["ticks"] <= 3:
+                for ev in rep["events"]:
+                    text = event_text(ev)
+                    if text:
+                        self.add_log(text, cat=ev[1] if ev[0] == "leave" else None)
+                # 【フェーズ2】初めて来た猫の特別なメッセージ
+                for cid in rep.get("first_visits", []):
+                    name = game.CATS[cid]["name"]
+                    self.add_log("はじめて {0} が来た！".format(name))
+            else:
+                self.add_log("{0}分たちました。猫が{1}回遊びに来たよ".format(rep["ticks"], rep["visits"]))
+            self.save()
+        self.handle_input()
+        self._advance_log_typing()
+        self.toast_tw.update(self._play_type_sound)
+        for pager in self._visible_pagers():
+            pager.update(self._play_type_sound)
+        if self.toast:
+            if self.toast_tw.done:
+                self.toast["frames"] -= 1
+                if self.toast["frames"] <= 0:
+                    self.toast = None
+
+    # ------------------------------------------------------------ 描画の部品
+    def hit(self, x, y, w, h, fn, clip=None):
+        self.hits.append((x, y, w, h, fn, clip))
+
+    def button(self, x, y, w, h, label, fn, enabled=True, active=False, clip=None):
+        fill = C_PANEL if not active else C_DIM
+        pyxel.rect(x, y, w, h, fill)
+        pyxel.rectb(x, y, w, h, C_ACCENT if active else C_DIM)
+        col = C_TEXT if enabled else C_DIM
+        tw = self.tw(label)
+        self.tx(x + (w - tw) // 2, y + (h - FONT_SIZE) // 2, label, col)
+        self.hit(x, y, w, h, fn, clip)
+
+    def list_view(self, key, x, y, w, h, n, draw_row):
+        """縦に並べるリスト。見えている行だけ描くので、行が何千あっても軽い。右端のバーはドラッグで動かせる。"""
+        maxs = max(0, n * ROW_H - h)
+        off = min(max(self.scroll.get(key, 0), 0), maxs)
+        self.scroll[key] = off
+        self.areas.append((key, x, y, w, h, maxs))
+        pyxel.clip(x, y, w, h)
+        first = int(off // ROW_H)
+        for i in range(first, min(n, first + h // ROW_H + 2)):
+            draw_row(i, y + i * ROW_H - int(off), (x, y, w, h))
+        pyxel.clip()
+        if maxs > 0:
+            total = maxs + h
+            bar_h = max(10, h * h // total)
+            bar_y = y + (h - bar_h) * off // maxs
+            pyxel.rect(x + w - BAR_W, y, BAR_W, h, C_PANEL)                    # 溝
+            pyxel.rect(x + w - BAR_W, int(bar_y), BAR_W, bar_h, C_DIM)         # つまみ
+
+    def draw_panel(self, x, y, w, h):
+        pyxel.rect(x, y, w, h, C_PANEL)
+        pyxel.rectb(x, y, w, h, C_DIM)
+
+    # ------------------------------------------------------------ 描画
+    def draw(self):
+        self.hits, self.areas, self.pager_regs = [], [], []
+        pyxel.cls(C_BG)
+        self.draw_header()
+        getattr(self, "draw_" + self.screen)()
+        self.draw_tabs()
+        if self.toast:
+            self.draw_toast()
+        if self.modal:
+            self.draw_modal()
+        if self.message:
+            self.draw_message()
+
+    def draw_header(self):
+        s = self.state
+        pyxel.rect(0, 0, SCREEN_W, HEADER_H, C_PANEL)
+        self.tx(6, 3, "銀 {0}".format(s["s_fish"]), C_SILVER)
+        self.tx(76, 3, "金 {0}".format(s["g_fish"]), C_GOLD)
+        # 【フェーズ3】場所切り替え（にわタブのとき）
+        if self.screen == "yard":
+            places = game.available_places(s)
+            if len(places) > 1:
+                x = 140
+                for p in places:
+                    name = game.PLACES[p]["name"]
+                    active = p == s["current_place"]
+                    col = C_ACCENT if active else C_SUB
+                    w = self.tw(name) + 8
+                    self.tx(x, 3, name, col)
+                    if not active:
+                        self.hit(x, 0, w, HEADER_H, lambda pid=p: self.do_switch_place(pid))
+                    x += w + 8
+        title = dict(TABS)[self.screen]
+        self.tx_right(SCREEN_W - 6, 3, title, C_SUB)
+
+    def draw_tabs(self):
+        w = SCREEN_W // len(TABS)
+        pending = bool(self.state["pending_money"] or self.state["pending_treasures"])
+        for i, (name, label) in enumerate(TABS):
+            self.button(i * w, TAB_Y, w, TAB_H, label, lambda n=name: self.goto(n), active=(name == self.screen))
+            if name == "yard" and pending and self.screen != "yard":
+                pyxel.circ(i * w + w - 7, TAB_Y + 6, 3, C_ACCENT)   # 受け取れるものがある印
+
+    def draw_toast(self):
+        col = self.toast["col"]
+        total_lines = self.toast_tw.text.split("\n")
+        h = len(total_lines) * LINE_H + 8
+        self.draw_panel(6, HEADER_H + 4, SCREEN_W - 12, h)
+        for i, line in enumerate(self.toast_tw.visible.split("\n")):
+            self.tx(12, HEADER_H + 8 + i * LINE_H, line, col)
+
+    def draw_message(self):
+        self.hits, self.areas, self.pager_regs = [], [], []     # 背後の操作は無効にする
+        self.draw_panel(MSG_X, MSG_Y, MSG_W, MSG_H)
+        pager = self.message["pager"]
+        pager.draw(self, MSG_X, MSG_Y)
+        if pager.tw.done and not pager.has_next:
+            self.tx_right(MSG_X + MSG_W - PAD_X, MSG_Y + MSG_H - PAD_Y - FONT_SIZE, "タップで閉じる", C_DIM)
+
+    def draw_modal(self):
+        self.hits, self.areas, self.pager_regs = [], [], []
+        m = self.modal
+        x, w = 24, SCREEN_W - 48
+
+        if m.get("mode") == "trade":
+            goods_list = m["goods_list"]
+            selected = m["selected"]
+            header_h = LINE_H + 12
+            item_h = len(goods_list) * ROW_H + 8
+            btn_h = 30
+            h = header_h + item_h + btn_h
+            y = max(30, (SCREEN_H - h) // 2)
+
+            self.draw_panel(x, y, w, h)
+            self.tx(x + 10, y + 8, "{0}に何を渡しますか？".format(m["actor_name"]), C_ACCENT)
+
+            iy = y + header_h
+            for i, gid in enumerate(goods_list):
+                it = game.GOODS[gid]
+                col = C_ACCENT if i == selected else C_TEXT
+                if i == selected:
+                    pyxel.rect(x + 4, iy + i * ROW_H, w - 8, ROW_H, C_PANEL)
+                self.tx(x + 10, iy + i * ROW_H + 2, it["name"], col)
+                self.hit(x + 4, iy + i * ROW_H, w - 8, ROW_H, lambda idx=i: self._select_trade_item(idx))
+
+            by = y + h - 26
+            self.button(x + 14, by, 80, 18, "渡す", self._modal_yes)
+            self.button(x + w - 94, by, 80, 18, "やめる", self._modal_no)
+        else:
+            lines = self.wrap(m["text"], 164)
+            h = len(lines) * LINE_H + 44
+            y = 90
+            self.draw_panel(x, y, w, h)
+            for i, line in enumerate(lines):
+                self.tx(x + 10, y + 10 + i * LINE_H, line, C_TEXT)
+            by = y + h - 26
+            self.button(x + 14, by, 80, 18, "はい", self._modal_yes)
+            self.button(x + w - 94, by, 80, 18, "いいえ", self._modal_no)
+
+    def _modal_yes(self):
+        fn = self.modal["yes"]
+        self.modal = None
+        fn()
+
+    def _select_trade_item(self, idx):
+        self.modal["selected"] = idx
+
+    def _modal_no(self):
+        self.modal = None
+
+    # ---- にわ
+    def draw_yard(self):
+        s = self.state
+        if s["food"]:
+            self.tx(8, 22, "エサ: {0} 残り{1}".format(game.FOODS[s["food"]]["name"], s["food_remaining"]), C_GOOD)
+        else:
+            self.tx(8, 22, "エサがありません(もちもの→エサ)", C_BAD)
+
+        # 【フェーズ1・2】庭にいる猫の外見描写を表示
+        in_yard = [(cid, s["cats"][cid]) for cid in s["cats"] if s["cats"][cid]["in_yard"]]
+        y_cat_bottom = 34  # エサ表示の下
+        if in_yard:
+            y_cat = 34
+            for cid, c in in_yard:
+                name = game.CATS[cid]["name"]
+                desc = game.cat_state_text(cid, s)
+                self.tx(8, y_cat, "{0}が{1}".format(name, desc), C_SUB)
+                y_cat += LINE_H
+            y_cat_bottom = y_cat  # 猫表示の最終y位置
+
+        y = y_cat_bottom + 4  # 猫表示の下からおもちゃリストを開始
+        yard_bottom = y
+        if not s["yard"]:
+            for i, line in enumerate(self.wrap("庭にはおもちゃがありません。ショップで買って、もちものから置こう", SCREEN_W - 16)):
+                self.tx(8, y + i * LINE_H, line, C_SUB)
+                yard_bottom = y + (i + 1) * LINE_H
+        for i, toy in enumerate(s["yard"]):
+            spec = game.TOYS[toy]
+            self.tx(8, y + i * ROW_H, spec["name"], C_TEXT)
+            occ = game.occupants(s, toy)
+            if occ:
+                names = "、".join(game.CATS[c]["name"] for c in occ)
+                names = self.fit(names, 110, "{0}匹".format(len(occ)))
+                self.tx_right(SCREEN_W - 8, y + i * ROW_H, names, C_ACCENT)
+            else:
+                self.tx_right(SCREEN_W - 8, y + i * ROW_H, "(空き)", C_DIM)
+            yard_bottom = y + (i + 1) * ROW_H
+
+        # 【フェーズ3】アクター表示
+        yard_bottom = self._draw_actors(yard_bottom + 6)
+
+        # 「できごと」見出し→区切り線→ログ、の順に、フォントの実寸に合わせて積み上げる
+        # (ボタン行の上で必ず収まるよう、はみ出したらログの行数を減らす)
+        buttons_y = 194
+        label_y = yard_bottom + 6
+        line_y = label_y + FONT_SIZE + 3
+        log_y = line_y + 5
+        max_log_lines = max(1, (buttons_y - 4 - log_y) // LINE_H)
+
+        self.tx(8, label_y, "できごと", C_SUB)
+        pyxel.line(8, line_y, SCREEN_W - 8, line_y, C_DIM)
+        for i, line in enumerate(self.visible_log(max_log_lines)):
+            self.tx(10, log_y + i * LINE_H, line, C_TEXT)
+
+        n_money = len(s["pending_money"])
+        n_tre = len(s["pending_treasures"])
+        self.button(8, buttons_y, 118, 20, "さかなを受け取る({0})".format(n_money) if n_money else "さかな なし",
+                    self.do_collect, enabled=bool(n_money))
+        self.button(130, buttons_y, 118, 20, "お宝を受け取る({0})".format(n_tre) if n_tre else "お宝 なし",
+                    self.do_treasures, enabled=bool(n_tre))
+
+    def do_switch_place(self, pid):
+        r = game.switch_place(self.state, pid)
+        self.show_toast(r.msg, C_GOOD if r.ok else C_BAD)
+        if r.ok:
+            self.save()
+
+    def _draw_actors(self, y):
+        s = self.state
+        pid = s["current_place"]
+        actors_here = []
+        for aid, actor in game.ACTORS.items():
+            if pid not in actor["habitat"]:
+                continue
+            astate = s["actor_states"].get(aid, {})
+            if astate.get("in_place"):
+                actors_here.append((aid, actor, astate))
+        if not actors_here:
+            return y
+        self.tx(8, y, "訪問者", C_SUB)
+        y += LINE_H + 2
+        for aid, actor, astate in actors_here:
+            name = actor["name"]
+            role_mark = "@ " if actor["role"] == "person" else "* "
+            self.tx(12, y, role_mark + name, C_TEXT)
+            gifts = actor.get("gifts", [])
+            has_gift = gifts and not astate.get("reward_given")
+            if has_gift:
+                self.tx_right(ROW_RIGHT, y, "ギフト", C_ACCENT)
+            # タップ判定を追加
+            self.hit(8, y, SCREEN_W - 16, ROW_H, lambda a=aid: self.tap_actor(a))
+            y += ROW_H
+        return y + 4
+
+    def tap_actor(self, aid):
+        s = self.state
+        actor = game.ACTORS[aid]
+        astate = s["actor_states"].get(aid, {})
+        gifts = actor.get("gifts", [])
+        has_gift = gifts and not astate.get("reward_given")
+
+        if actor["role"] == "visitor" and has_gift:
+            # キャツアイからギフトを受け取る
+            import random
+            total = sum(g[1] for g in gifts)
+            r = random.random() * total
+            cum = 0
+            chosen = gifts[0][0]
+            for item, weight in gifts:
+                cum += weight
+                if r <= cum:
+                    chosen = item
+                    break
+            # item:smartphone → smartphone
+            item_id = chosen[5:] if chosen.startswith("item:") else chosen
+            s["inventory"][item_id] = s["inventory"].get(item_id, 0) + 1
+            astate["reward_given"] = True
+            self.show_toast("{0}から{1}をもらった".format(actor["name"], game.GOODS[item_id]["name"]), C_GOOD)
+            self.save()
+        elif actor["role"] == "person" and actor.get("wants"):
+            # 取引モーダルを開く
+            self.open_trade_modal(aid)
+        else:
+            self.show_toast("{0}はこちらを見ている".format(actor["name"]), C_SUB)
+
+    def open_trade_modal(self, aid):
+        s = self.state
+        actor = game.ACTORS[aid]
+        goods_list = [g for g in game.GOODS if s["inventory"].get(g, 0) > 0]
+        if not goods_list:
+            self.show_toast("渡せるものを持っていません", C_BAD)
+            return
+        self.modal = {
+            "mode": "trade",
+            "aid": aid,
+            "actor_name": actor["name"],
+            "goods_list": goods_list,
+            "selected": 0,
+            "yes": lambda: self.do_trade(aid, goods_list[self.modal["selected"]]),
         }
 
-    return {
-        "s_fish": 100,
-        "g_fish": 0,
-        "yard": [],
-        "food": None,
-        "food_remaining": 0,
-        "owned_toys": [],
-        "food_stock": {},
-        "cats": {
-            cid: {
-                "met": False,
-                "given_treasure": False,
-                "total_time": 0,
-                "time_in_yard": 0,
-                "in_yard": False,
-                "toy": None,
-                "fullness": 0.5,
-                "trust": 0.0,
-                "happiness": 0.5,
-            }
-            for cid in CATS
-        },
-        "pending_money": [],
-        "pending_treasures": [],
-        "version": CATALOG_VERSION,
-        "last_advance": now,
-        "level": 0,
-        "flags": set(),
-        "met_actors": set(),
-        "inventory": {},
-        "actor_states": {},
-        "current_place": "garden",
-        "places": places,
-    }
+    def do_trade(self, aid, goods_id):
+        r = game.give(self.state, aid, goods_id)
+        self.show_toast(r.msg, C_GOOD if r.ok else C_BAD)
+        if r.ok:
+            self.save()
+            # 報酬があれば通知
+            actor = game.ACTORS[aid]
+            reward = actor.get("one_time_reward")
+            if reward:
+                if "item" in reward:
+                    name = game.GOODS[reward["item"]]["name"]
+                    self.show_toast("{0}をもらった".format(name), C_ACCENT)
+                if "creature" in reward:
+                    self.show_toast("新しい仲間が増えた", C_ACCENT)
+                if "unlocks" in reward:
+                    self.show_toast("新しい場所が開放された", C_ACCENT)
 
+    def do_collect(self):
+        got = game.collect(self.state)
+        if not got:
+            self.show_toast("猫たちはまだ何も残していきませんでした", C_SUB)
+            return
+        total = {"s": 0, "g": 0}
+        for _cid, amount, cur in got:
+            total[cur] += amount
+        parts = [fish_text(v, c) for c, v in total.items() if v]
+        self.show_toast("やったね! {0}を受け取りました".format("と".join(parts)), C_GOOD)
+        self.save()
 
-# ---------------------------------------------------------------------------
-# フェーズ2互換: yard/food 同期
-# ---------------------------------------------------------------------------
+    def do_treasures(self):
+        got = game.collect_treasures(self.state)
+        if not got:
+            self.show_toast("受け取れるお宝はありません", C_SUB)
+            return
+        texts = ["{0}が「{1}」をくれました!".format(game.CATS[c]["name"], game.CATS[c]["treasure"]) for c in got]
+        self.show_toast("\n".join(texts), C_ACCENT)
+        self.save()
 
-def _sync_from_current_place(state):
-    """current_place の場所データを state['yard'] / state['food'] に反映"""
-    pid = state["current_place"]
-    if pid in state["places"]:
-        p = state["places"][pid]
-        state["yard"] = p.get("yard", [])
-        state["food"] = p.get("food")
-        state["food_remaining"] = p.get("food_remaining", 0)
+    # ---- ショップ
+    def sub_tabs(self, screen, y=20):
+        """もちものの種別タブ。最初は何も押されていない(=すべて表示)。押したタブをもう一度押すと解除される。"""
+        for i, label in enumerate(("おもちゃ", "エサ")):
+            self.button(8 + i * 68, y, 64, 16, label, lambda i=i: self.set_sub(screen, i), active=(self.sub[screen] == i))
 
+    def set_sub(self, screen, i):
+        self.sub[screen] = None if self.sub[screen] == i else i
+        self.selected[screen] = None
 
-def _sync_to_current_place(state):
-    """state['yard'] / state['food'] を current_place の場所データに反映"""
-    pid = state["current_place"]
-    if pid in state["places"]:
-        p = state["places"][pid]
-        p["yard"] = state["yard"]
-        p["food"] = state["food"]
-        p["food_remaining"] = state["food_remaining"]
-
-
-# ---------------------------------------------------------------------------
-# レベル・条件判定
-# ---------------------------------------------------------------------------
-
-def gain_level(state, delta, reason=None):
-    old = state["level"]
-    state["level"] = old + delta
-    return old, state["level"]
-
-
-def meets(requires, state):
-    if not requires:
-        return True
-    for key, value in requires.items():
-        if key == "level":
-            if state.get("level", 0) < value:
-                return False
-        elif key == "flag":
-            if value not in state.get("flags", set()):
-                return False
-        elif key == "items":
-            inv = set(state.get("owned_toys", []))
-            inv.update(state.get("food_stock", {}).keys())
-            inv.update(state.get("inventory", {}).keys())
-            if not all(item in inv for item in value):
-                return False
-        elif key == "cats_met":
-            met = sum(1 for c in state.get("cats", {}).values() if c.get("met"))
-            if met < value:
-                return False
+    def arrow_button(self, x, y, w, h, direction, fn, enabled=True):
+        """◀ ▶ のボタン(フォントに依存しないよう、三角を自分で描く)。"""
+        self.button(x, y, w, h, "", fn, enabled=enabled)
+        col = C_TEXT if enabled else C_DIM
+        cx, cy = x + w // 2, y + h // 2
+        if direction < 0:
+            pyxel.tri(cx + 2, cy - 4, cx + 2, cy + 4, cx - 3, cy, col)
         else:
-            pass
-    return True
-
-
-# ---------------------------------------------------------------------------
-# 場所
-# ---------------------------------------------------------------------------
-
-def available_places(state):
-    return [pid for pid in PLACES if meets(PLACES[pid]["requires"], state)]
-
-
-def switch_place(state, pid):
-    if pid not in PLACES:
-        return Result(False, "その場所は存在しません", "no_place")
-    if pid not in available_places(state):
-        return Result(False, "まだ行けません", "locked")
-    _sync_to_current_place(state)
-    state["current_place"] = pid
-    _sync_from_current_place(state)
-    return Result(True, PLACES[pid]["name"] + "に移動した", "ok")
-
-def set_food(state, food_id, force=False):
-    if not force:
-        if state.get("food"):
-            return Result(False, "すでにエサが置いてあります。置き換えますか？", "need_confirm")
-    if state["food_stock"].get(food_id, 0) <= 0:
-        return Result(False, "持ってません", "not_owned")
-    state["food_stock"][food_id] -= 1
-    state["food"] = food_id
-    state["food_remaining"] = FOODS.get(food_id, {}).get("amount", 0) if food_id else 0
-    pid = state["current_place"]
-    if pid in state["places"]:
-        state["places"][pid]["food"] = state["food"]
-        state["places"][pid]["food_remaining"] = state["food_remaining"]
-    return Result(True, FOODS[food_id]["name"] + "を置いた", "ok")
-
-
-
-# ---------------------------------------------------------------------------
-# ゲーム進行
-# ---------------------------------------------------------------------------
-
-def advance(state, now):
-    _sync_from_current_place(state)
-
-    last = state.get("last_advance", now)
-    elapsed = now - last
-    ticks = min(int(elapsed // 60), 60)
-    state["last_advance"] = now - (elapsed % 60)
-
-    events = []
-    visits = 0
-    bonus_treasure = None
-
-    pid = state["current_place"]
-    place = PLACES.get(pid)
-    space = place["space"] if place else 6
-
-    food_id = state.get("food")
-    food_tags = FOODS.get(food_id, {}).get("tags", {}) if food_id else {}
-
-    # アクター出現判定
-    for aid, actor in ACTORS.items():
-        if pid not in actor["habitat"]:
-            continue
-        if not meets(actor["requires"], state):
-            continue
-        astate = state["actor_states"].setdefault(aid, {
-            "met": False, "in_place": False, "timer": 0, "reward_given": False,
-        })
-        if not astate["met"]:
-            astate["met"] = True
-            state["met_actors"].add(aid)
-            events.append(("actor_met", aid))
-        if not astate["in_place"]:
-            astate["in_place"] = True
-            astate["timer"] = 0
-            events.append(("actor_arrive", aid))
-
-    for _ in range(ticks):
-        # ---- アクタータイマー ----
-        for aid, astate in state["actor_states"].items():
-            if astate.get("in_place"):
-                astate["timer"] = astate.get("timer", 0) + 1
-
-        # ---- エサの減り ----
-        if food_id and state["food_remaining"] > 0:
-            eaters = [cid for cid, c in state["cats"].items() if c["in_yard"]]
-            total_eat = 0
-            for cid in eaters:
-                spec = CATS[cid]
-                appetite = spec["traits"]["appetite"]
-                if appetite < 0.5:
-                    if random.random() >= appetite * 2:
-                        continue
-                    eat = 1
-                elif appetite >= 0.8:
-                    eat = 2
-                else:
-                    eat = 1
-                total_eat += eat
-                c = state["cats"][cid]
-                c["fullness"] = min(1.0, c["fullness"] + 0.08 * eat)
-            state["food_remaining"] = max(0, state["food_remaining"] - total_eat)
-
-        # ---- 満腹度減少 ----
-        for c in state["cats"].values():
-            c["fullness"] = max(0.0, c["fullness"] - 0.015)
-
-        # ---- 猫の滞在時間 ----
-        for cid, c in list(state["cats"].items()):
-            if not c["in_yard"]:
-                continue
-            c["time_in_yard"] += 1
-            c["total_time"] += 1
-            spec = CATS[cid]
-            limit = spec["time_limit"]
-
-            if c["time_in_yard"] >= limit:
-                c["in_yard"] = False
-                c["toy"] = None
-                c["time_in_yard"] = 0
-                amount = random.randint(1, 3)
-                if spec["traits"]["friendly"] > 0.6:
-                    amount += 1
-                state["pending_money"].append((cid, amount, "s"))
-                if random.random() < 0.1:
-                    state["pending_treasures"].append(cid)
-                    bonus_treasure = cid
-                events.append(("leave", cid))
-
-        # ---- 猫の来訪 ----
-        if food_id and state["food_remaining"] > 0:
-            used = space_used(state)
-            free_space = space - used
-
-            for cid, spec in CATS.items():
-                c = state["cats"][cid]
-                if c["in_yard"]:
-                    continue
-                if pid not in spec["habitat"]:
-                    continue
-
-                base_chance = spec["entry_chance"]
-                taste = catalog.taste_score(spec["taste"], food_tags)
-                fullness_factor = 1 - c["fullness"] * 0.6
-                chance = base_chance * taste * fullness_factor
-
-                if free_space <= 0:
-                    continue
-
-                if random.random() < chance:
-                    yard = state["yard"]
-                    toy = None
-                    if yard:
-                        # 他の猫が使っているおもちゃは除外
-                        used_toys = {other["toy"] for other in state["cats"].values()
-                                     if other["in_yard"] and other["toy"]}
-                        available = [t for t in yard if t not in used_toys]
-                        if available:
-                            fav = spec.get("fav_toy")
-                            if fav and fav in available:
-                                toy = fav
-                            else:
-                                toy = random.choice(available)
-                        # available が空なら toy = None（おもちゃなしで来訪）
-                    c["in_yard"] = True
-                    if not c["met"]:
-                        gain_level(state, 1, "met_new_cat")
-                    c["met"] = True
-                    c["time_in_yard"] = 0
-                    c["toy"] = toy
-                    visits += 1
-                    free_space -= 1
-                    events.append(("arrive", cid))
-
-    _sync_to_current_place(state)
-
-    return {"ticks": ticks, "events": events, "visits": visits,
-            "bonus_treasure": bonus_treasure,
-            "first_visits": [cid for cid, c in state["cats"].items()
-                             if c["met"] and c["total_time"] == 0 and c["time_in_yard"] == 0]}
-
-
-def resume(state, now):
-    return advance(state, now)
-
-
-# ---------------------------------------------------------------------------
-# ショップ
-# ---------------------------------------------------------------------------
-
-def shop_ids(state, kind, filt, sort):
-    if kind == "goods":
-        return []  # GOODS はショップで販売しない（ギフト経由のみ）
-    ids = IDS_BY_KIND.get(kind, []) if kind else (
-        IDS_BY_KIND.get("toy", []) + IDS_BY_KIND.get("food", [])
-    )
-    if filt == "afford":
-        ids = [iid for iid in ids
-               if state[ITEMS[iid]["cur"] + "_fish"] >= ITEMS[iid]["cost"]]
-    elif filt == "new":
-        owned = set(state["owned_toys"])
-        ids = [
-            iid for iid in ids
-            if (ITEMS[iid]["kind"] == "toy" and iid not in owned)
-            or (ITEMS[iid]["kind"] == "food" and state["food_stock"].get(iid, 0) <= 0)
-        ]
-    if sort == "price_asc":
-        ids = sorted(ids, key=lambda iid: (ITEMS[iid]["cur"] != "s", ITEMS[iid]["cost"]))
-    elif sort == "price_desc":
-        ids = sorted(ids, key=lambda iid: (ITEMS[iid]["cur"] != "g", ITEMS[iid]["cost"]),
-                     reverse=True)
-    return ids
-
-
-def buy(state, item_id):
-    it = ITEMS[item_id]
-    cur = it["cur"] + "_fish"
-    if state[cur] < it["cost"]:
-        return Result(False, "{0}が足りません".format("銀のさかな" if it["cur"] == "s" else "金のさかな"),
-                      "not_enough")
-    state[cur] -= it["cost"]
-    if it["kind"] == "toy":
-        state["owned_toys"].append(item_id)
-    else:
-        state["food_stock"][item_id] = state["food_stock"].get(item_id, 0) + 1
-    keeper_line = random.choice(catalog.SHOP_KEEPER_LINES)
-    msg = "{0}を買いました\n『{1}』".format(it["name"], keeper_line)
-    return Result(True, msg, "ok")
-
-
-def price_text(item_id):
-    it = ITEMS[item_id]
-    if it["cur"] == "s":
-        return "銀{0}匹".format(it["cost"])
-    else:
-        return "金{0}匹".format(it["cost"])
-
-
-# ---------------------------------------------------------------------------
-# 庭の操作
-# ---------------------------------------------------------------------------
-
-def space_used(state):
-    _sync_from_current_place(state)
-    return sum(TOYS[t]["size"] for t in state["yard"])
-
-
-def place_toy(state, toy_id):
-    _sync_from_current_place(state)
-    if toy_id in state["yard"]:
-        return Result(False, "すでに置いてあります", "already_placed")
-    pid = state["current_place"]
-    place = PLACES.get(pid)
-    space = place["space"] if place else 6
-    if space_used(state) + TOYS[toy_id]["size"] > space:
-        return Result(False, "スペースが足りません", "no_space")
-    state["yard"].append(toy_id)
-    _sync_to_current_place(state)
-    return Result(True, "{0}を置きました".format(TOYS[toy_id]["name"]), "ok")
-
-
-def remove_toy(state, toy_id):
-    _sync_from_current_place(state)
-    if toy_id not in state["yard"]:
-        return Result(False, "ありません", "not_placed")
-    state["yard"].remove(toy_id)
-    for c in state["cats"].values():
-        if c["toy"] == toy_id:
-            c["toy"] = None
-    _sync_to_current_place(state)
-    return Result(True, "{0}を片付けました".format(TOYS[toy_id]["name"]), "ok")
-
-
-def set_food(state, food_id, force=False):
-    _sync_from_current_place(state)
-    if state["food_stock"].get(food_id, 0) <= 0:
-        return Result(False, "持ってません", "not_owned")
-    if state["food"] and not force:
-        return Result(False, "エサを置きかえますか？", "need_confirm")
-    state["food"] = food_id
-    state["food_remaining"] = FOODS[food_id]["minutes"]
-    state["food_stock"][food_id] -= 1
-    if state["food_stock"][food_id] <= 0:
-        del state["food_stock"][food_id]
-    _sync_to_current_place(state)
-    return Result(True, "{0}を置きました".format(FOODS[food_id]["name"]), "ok")
-
-
-# ---------------------------------------------------------------------------
-# 報酬
-# ---------------------------------------------------------------------------
-
-def collect(state):
-    got = state["pending_money"][:]
-    state["pending_money"] = []
-    for _cid, amount, cur in got:
-        state[cur + "_fish"] += amount
-    return got
-
-
-def collect_treasures(state):
-    got = state["pending_treasures"][:]
-    state["pending_treasures"] = []
-    for cid in got:
-        state["cats"][cid]["given_treasure"] = True
-    return got
-
-
-# ---------------------------------------------------------------------------
-# 取引
-# ---------------------------------------------------------------------------
-
-def give(state, actor_id, goods_id):
-    if actor_id not in ACTORS:
-        return Result(False, "その人はいません", "no_actor")
-    if goods_id not in GOODS:
-        return Result(False, "その品物はありません", "no_goods")
-    if state["inventory"].get(goods_id, 0) <= 0:
-        return Result(False, "持っていません", "not_owned")
-
-    actor = ACTORS[actor_id]
-    astate = state["actor_states"].get(actor_id, {})
-
-    if not astate.get("in_place"):
-        return Result(False, "今はいません", "not_here")
-
-    # wants チェック
-    goods_tags = GOODS[goods_id].get("tags", {})
-    wants = actor.get("wants", {})
-    if wants:
-        match = False
-        for tag, threshold in wants.items():
-            if goods_tags.get(tag, 0) >= threshold:
-                match = True
-                break
-        if not match:
-            return Result(False, "これは不要のようだ", "not_wanted")
-
-    # 渡す
-    state["inventory"][goods_id] -= 1
-    if state["inventory"][goods_id] <= 0:
-        del state["inventory"][goods_id]
-
-    # 報酬
-    reward = actor.get("one_time_reward")
-    if reward and not astate.get("reward_given"):
-        astate["reward_given"] = True
-        apply_reward(state, reward)
-        return Result(True, "{0}に{1}を渡した".format(actor["name"], GOODS[goods_id]["name"]), "rewarded")
-
-    return Result(True, "{0}に{1}を渡した".format(actor["name"], GOODS[goods_id]["name"]), "ok")
-
-
-def apply_reward(state, reward):
-    if not reward:
-        return
-    if "item" in reward:
-        item_id = reward["item"]
-        state["inventory"][item_id] = state["inventory"].get(item_id, 0) + 1
-    if "creature" in reward:
-        creature = reward["creature"]
-        state["flags"].add("creature_" + creature)
-    if "unlocks" in reward:
-        unlocks = reward["unlocks"]
-        state["flags"].add("unlocked_" + unlocks)
-    if "flag" in reward:
-        state["flags"].add(reward["flag"])
-
-
-# ---------------------------------------------------------------------------
-# クエリ
-# ---------------------------------------------------------------------------
-
-def occupants(state, toy_id):
-    return [cid for cid, c in state["cats"].items() if c["in_yard"] and c["toy"] == toy_id]
-
-
-def met_list(state):
-    return [cid for cid in CATS if state["cats"][cid]["met"]]
-
-
-# ---------------------------------------------------------------------------
-# イベントテキスト
-# ---------------------------------------------------------------------------
-
-def event_text(ev):
-    typ = ev[0]
-    if typ in ("arrive", "leave"):
-        cid = ev[1]
-        name = CATS[cid]["name"]
-        if typ == "arrive":
-            return "{0}が遊びに来た".format(name)
-        if typ == "leave":
-            return "{0}が帰った".format(name)
-    if typ == "actor_met":
-        aid = ev[1]
-        return "{0}と出会った".format(ACTORS[aid]["name"])
-    if typ == "actor_arrive":
-        aid = ev[1]
-        return "{0}が来た".format(ACTORS[aid]["name"])
-    return None
-
-
-def cat_state_text(cid, state):
-    """猫の外から見た描写を返す（フレーム間で安定）"""
-    c = state["cats"][cid]
-    fullness = c["fullness"]
-    toy = c.get("toy")
-
-    def _pick(key, descs):
-        idx = hash((cid, key, int(fullness * 10))) % len(descs)
-        return descs[idx]
-
-    # まずおもちゃで遊んでいる描写を優先
-    if toy and c["in_yard"]:
-        descs = catalog.CAT_TOY_DESCRIPTIONS.get(toy, catalog.CAT_TOY_DESCRIPTIONS["default"])
-        return _pick(f"toy_{toy}", descs)
-
-    # 満腹度に応じた描写
-    if fullness < 0.2:
-        return _pick("very_hungry", catalog.CAT_STATE_DESCRIPTIONS["very_hungry"])
-    elif fullness < 0.5:
-        return _pick("hungry", catalog.CAT_STATE_DESCRIPTIONS["hungry"])
-    elif fullness < 0.8:
-        return _pick("content", catalog.CAT_STATE_DESCRIPTIONS["content"])
-    else:
-        return _pick("full", catalog.CAT_STATE_DESCRIPTIONS["full"])
-
-
-# ---------------------------------------------------------------------------
-# 初期化
-# ---------------------------------------------------------------------------
-
-load_catalog()
+            pyxel.tri(cx - 2, cy - 4, cx - 2, cy + 4, cx + 3, cy, col)
+
+    def close_button(self, x, y, w, h, fn):
+        """× のボタン(線を自分で描く)。"""
+        self.button(x, y, w, h, "", fn)
+        cx, cy = x + w // 2, y + h // 2
+        for dx in (0, 1):
+            pyxel.line(cx - 4 + dx, cy - 4, cx + 4 + dx, cy + 4, C_TEXT)
+            pyxel.line(cx - 4 + dx, cy + 4, cx + 4 + dx, cy - 4, C_TEXT)
+
+    def _shop_set_kind(self, i):
+        """種別タブ。押すとその種別だけを表示し、押されているタブをもう一度押すと解除(すべて表示)に戻る。"""
+        self.shop_kind = None if self.shop_kind == i else i
+        self.scroll.pop("shop", None)
+
+    def _shop_page_kinds(self, d):
+        n = len(SHOP_KINDS)
+        self.shop_cat_off = min(max(self.shop_cat_off + d, 0), max(0, n - 2))
+
+    def _shop_cycle(self, what):
+        if what == "filter":
+            self.shop_filter = (self.shop_filter + 1) % len(game.SHOP_FILTERS)
+        else:
+            self.shop_sort = (self.shop_sort + 1) % len(game.SHOP_SORTS)
+        self.scroll.pop("shop", None)
+
+    def _shop_strip(self):
+        """種別タブ(種別が3つ以上なら ◀ ▶ でめくる)と、絞り込み・並べ替えのボタン。"""
+        cats = SHOP_KINDS
+        n = len(cats)
+        if self.shop_kind is not None and self.shop_kind >= n:
+            self.shop_kind = None
+        y, h = 20, 16
+        if n <= 2:
+            slots, x0, w = list(range(n)), 8, 52
+        else:
+            off = min(self.shop_cat_off, n - 2)
+            slots, x0, w = [off, off + 1], 24, 40
+            self.arrow_button(8, y, 14, h, -1, lambda: self._shop_page_kinds(-1), enabled=off > 0)
+            self.arrow_button(x0 + 2 * (w + 2), y, 14, h, 1, lambda: self._shop_page_kinds(1), enabled=off + 2 < n)
+        for k, idx in enumerate(slots):
+            label = self.fit(cats[idx][1], w - 4)
+            self.button(x0 + k * (w + 2), y, w, h, label, lambda idx=idx: self._shop_set_kind(idx),
+                        active=(idx == self.shop_kind))
+        self.button(126, y, 58, h, game.SHOP_FILTERS[self.shop_filter][1], lambda: self._shop_cycle("filter"),
+                    active=self.shop_filter != 0)
+        self.button(186, y, 62, h, game.SHOP_SORTS[self.shop_sort][1], lambda: self._shop_cycle("sort"),
+                    active=self.shop_sort != 0)
+
+    def _shop_ids(self, kind):
+        """表示するアイテムID。条件と持ち物が変わったときだけ作り直す(商品が何千あっても毎フレームは数えない)。"""
+        s = self.state
+        filt = game.SHOP_FILTERS[self.shop_filter][0]
+        sort = game.SHOP_SORTS[self.shop_sort][0]
+        key = (game.CATALOG_VERSION, kind, filt, sort, s["s_fish"], s["g_fish"],
+               len(s["owned_toys"]), sum(s["food_stock"].values()))
+        if self._shop_cache[0] != key:
+            ids = game.shop_ids(s, kind, filt, sort)
+            self._shop_cache = (key, ids, {item_id: i for i, item_id in enumerate(ids)})
+        return self._shop_cache[1]
+
+    def draw_shop(self):
+        """最初は、種別タブも商品も何も選ばれていない状態(すべての商品が一覧で見える)。
+        商品をタップすると、その説明が下に開く。閉じるか、同じ商品をもう一度タップすると閉じて、一覧が広くなる。"""
+        s = self.state
+        self._shop_strip()
+        kind = SHOP_KINDS[self.shop_kind][0] if self.shop_kind is not None else None
+        ids = self._shop_ids(kind)
+        index = self._shop_cache[2]
+        owned_set = set(s["owned_toys"])
+
+        sel = self.selected["shop"]
+        if sel is not None and sel not in index:          # 条件を変えて一覧から消えた商品の説明は、閉じる
+            sel = self.selected["shop"] = None
+        if sel is not None:
+            # 説明パネルの高さは、説明の長さに合わせる(短い説明なら小さく、長いなら最大 SHOP_DESC_LINES 行+ページ送り)
+            info = self._shop_info(sel)
+            n_lines = len(self.wrap(info, SCREEN_W - 16 - 2 * PAD_X - FONT_SIZE))
+            th = 2 * PAD_Y + CURSOR_H + min(n_lines, SHOP_DESC_LINES) * LINE_H
+            panel_h = SHOP_HEAD_H + th
+            panel_y = TAB_Y - 4 - panel_h
+        else:
+            panel_y = panel_h = None
+        self.shop_panel_y = panel_y
+        list_bottom = panel_y - 4 if sel is not None else TAB_Y - 4
+        list_h = list_bottom - SHOP_TOP
+        if sel is not None and self._shop_reveal == sel:   # 説明が開いて一覧が狭くなったぶん、選んだ行が見える位置へ寄せる
+            top = index[sel] * ROW_H
+            off = self.scroll.get("shop", 0)
+            if top < off:
+                off = top
+            elif top + ROW_H > off + list_h:
+                off = top + ROW_H - list_h
+            self.scroll["shop"] = off
+        self._shop_reveal = None
+
+        def row(i, ry, clip):
+            item_id = ids[i]
+            it = game.ITEMS[item_id]
+            if self.selected["shop"] == item_id:
+                pyxel.rect(8, ry, SCREEN_W - 16, ROW_H, C_PANEL)
+            owned = it["kind"] == "toy" and item_id in owned_set
+            self.tx(12, ry + 2, it["name"], C_DIM if owned else C_TEXT)
+            if owned:
+                self.tx_right(ROW_RIGHT, ry + 2, "もっている", C_DIM)
+            else:
+                afford = s[it["cur"] + "_fish"] >= it["cost"]
+                self.tx_right(ROW_RIGHT, ry + 2, game.price_text(item_id), C_SUB if afford else C_BAD)
+            self.hit(8, ry, SCREEN_W - 16, ROW_H, lambda: self.select_shop(item_id), clip)
+
+        if not ids:
+            self.tx(12, SHOP_TOP + 6, "条件に合う商品はありません", C_SUB)
+        self.list_view("shop", 8, SHOP_TOP, SCREEN_W - 16, list_h, len(ids), row)
+
+        if sel is None:
+            return
+        it = game.ITEMS[sel]
+        self.draw_panel(8, panel_y, SCREEN_W - 16, panel_h)
+        # 見出し: 値段と名前。長い名前は「…」で省く(全文は、上の一覧の選択行に出ている)
+        self.tx(14, panel_y + 5, self.fit("{0}  {1}".format(game.price_text(sel), it["name"]), SHOP_BUY_X - 14 - 6), C_ACCENT)
+        owned = it["kind"] == "toy" and sel in owned_set
+        self.button(SHOP_BUY_X, panel_y + 2, 48, 16, "買う", self.do_buy, enabled=not owned)
+        self.close_button(SHOP_CLOSE_X, panel_y + 2, 22, 16, self.close_shop_panel)
+        ty = panel_y + SHOP_HEAD_H                         # 説明の枠: 見出しの下から、パネルの下端まで
+        self.shop_pager.set(("shop", sel), [(info, C_TEXT)], self.wrap, SCREEN_W - 16, th)
+        self.shop_pager.draw(self, 8, ty)
+        self.pager_regs.append((self.shop_pager, 8, ty, SCREEN_W - 16, th))
+
+    def select(self, screen, item_id):
+        self.selected[screen] = item_id
+
+    def _shop_info(self, item_id):
+        """商品の説明文(庭を使うマス数・エサのもつ時間を添える)。"""
+        it = game.ITEMS[item_id]
+        info = it["desc"]
+        if it["kind"] == "toy" and it["size"] > 1:
+            info += "(庭を{0}マス使う)".format(it["size"])
+        if it["kind"] == "food":
+            info += "(量{0})".format(it["minutes"])
+        return info
+
+    def select_shop(self, item_id):
+        """商品をタップ: 説明を開く。開いている商品をもう一度タップすると閉じる。"""
+        if self.selected["shop"] == item_id:
+            self.close_shop_panel()
+        else:
+            self.selected["shop"] = item_id
+            self._shop_reveal = item_id
+
+    def close_shop_panel(self):
+        self.selected["shop"] = None
+
+    def do_buy(self):
+        sel = self.selected["shop"]
+        if not sel:
+            return
+        r = game.buy(self.state, sel)
+        self.show_toast(r.msg, C_GOOD if r.ok else C_BAD)
+        if r.ok:
+            self.save()
+
+    # ---- もちもの
+    def draw_bag(self):
+        s = self.state
+        self.sub_tabs("bag")
+        self.tx_right(SCREEN_W - 8, 22, "庭 {0}/{1}マス".format(game.space_used(s), game.SPACE), C_SUB)
+
+        sub = self.sub["bag"]
+        toys = list(s["owned_toys"])
+        foods = [f for f in game.FOODS if s["food_stock"].get(f, 0) > 0]
+        goods = [g for g in game.GOODS if s["inventory"].get(g, 0) > 0]  # 【フェーズ3】
+        if sub == 0:
+            ids, empty = toys, "おもちゃを持っていません。ショップで買おう"
+        elif sub == 1:
+            ids, empty = foods, "エサを持っていません。ショップで買おう"
+        elif sub == 2:  # 【フェーズ3】取引品
+            ids, empty = goods, "取引品を持っていません。キャツアイからもらおう"
+        else:  # 何も押していない: 持っているものぜんぶ
+            ids, empty = toys + foods + goods, "まだ何も持っていません。ショプで買おう"
+
+        if not ids:
+            self.tx(12, 46, empty, C_SUB)
+
+        def row(i, ry, clip):
+            item_id = ids[i]
+            it = game.ITEMS[item_id]
+            if it["kind"] == "toy":
+                placed = item_id in s["yard"]
+                extra = "({0}マス)".format(it["size"]) if it["size"] > 1 else ""
+                self.tx(12, ry + 2, it["name"] + extra, C_TEXT)
+                self.tx_right(ROW_RIGHT, ry + 2, "置いてある" if placed else "置く", C_GOOD if placed else C_SUB)
+                fn = (lambda t=item_id: self.do_toggle_toy(t))
+            elif it["kind"] == "food":
+                self.tx(12, ry + 2, "{0} ×{1}".format(it["name"], s["food_stock"][item_id]), C_TEXT)
+                self.tx_right(ROW_RIGHT, ry + 2, "置く", C_SUB)
+                fn = (lambda f=item_id: self.do_set_food(f))
+            else:  # goods 【フェーズ3】
+                self.tx(12, ry + 2, "{0} ×{1}".format(it["name"], s["inventory"][item_id]), C_TEXT)
+                self.tx_right(ROW_RIGHT, ry + 2, "持ち物", C_SUB)
+                fn = lambda: None  # 取引品は庭では使えない、アクターに渡す
+            self.hit(8, ry, SCREEN_W - 16, ROW_H, fn, clip)
+
+        self.list_view("bag-" + str(self.sub["bag"]), 8, 40, SCREEN_W - 16, 150, len(ids), row)
+
+        self.draw_panel(8, 196, SCREEN_W - 16, 28)
+        if s["food"]:
+            self.tx(14, 203, "庭のサ: {0} 残り{1}".format(game.FOODS[s["food"]]["name"], s["food_remaining"]), C_GOOD)
+        else:
+            self.tx(14, 203, "庭のエサ: なし", C_BAD)
+
+    def do_toggle_toy(self, toy_id):
+        s = self.state
+        if toy_id in s["yard"]:
+            r = game.remove_toy(s, toy_id)
+        else:
+            r = game.place_toy(s, toy_id)
+        self.show_toast(r.msg, C_GOOD if r.ok else C_BAD)
+        if r.ok:
+            self.save()
+
+    def do_set_food(self, food_id):
+        r = game.set_food(self.state, food_id)
+        if r.code == "need_confirm":
+            self.modal = {"text": r.msg, "yes": lambda: self._set_food_force(food_id)}
+            return
+        self.show_toast(r.msg, C_GOOD if r.ok else C_BAD)
+        if r.ok:
+            self.save()
+
+    def _set_food_force(self, food_id):
+        r = game.set_food(self.state, food_id, force=True)
+        self.show_toast(r.msg, C_GOOD if r.ok else C_BAD)
+        if r.ok:
+            self.save()
+
+    # ---- おたから(猫の図鑑)
+    def draw_cats(self):
+        """図鑑は「出会った順」に並ぶ。猫がはじめて庭に来たときに、その順番の位置が決まる。
+        まだ出会っていない猫の数や、全部で何匹いるかは出さない(出会いの楽しみを取っておくため)。"""
+        s = self.state
+        met = game.met_list(s)
+
+        def row(i, ry, clip):
+            cid = met[i]
+            c = s["cats"][cid]
+            if self.selected["cats"] == cid:
+                pyxel.rect(8, ry, SCREEN_W - 16, ROW_H, C_PANEL)
+            sex_mark = "♂ " if game.CATS[cid]["sex"] == "m" else "♀ "
+            self.tx(12, ry + 2, ("★ " if c["given_treasure"] else "") + sex_mark + game.CATS[cid]["name"], C_TEXT)
+            self.tx_right(ROW_RIGHT, ry + 2, "計{0}分".format(c["total_time"] + c["time_in_yard"]), C_SUB)
+            self.hit(8, ry, SCREEN_W - 16, ROW_H, lambda cid=cid: self.select("cats", cid), clip)
+
+        list_y, list_h = HEADER_H + 6, 4 * ROW_H          # 4行分。プロフィールを6行まで1ページに収めるため
+        if not met:
+            self.tx(12, list_y + 4, "猫が遊びに来ると、ここに載ります", C_SUB)
+        self.list_view("cats", 8, list_y, SCREEN_W - 16, list_h, len(met), row)
+
+        panel_y = list_y + list_h + 6
+        panel_h = TAB_Y - 4 - panel_y
+        self.draw_panel(8, panel_y, SCREEN_W - 16, panel_h)
+        sel = self.selected["cats"]
+        if sel in s["cats"] and s["cats"][sel]["met"]:
+            c = s["cats"][sel]
+            key = ("cat", sel, c["given_treasure"], c["in_yard"], c["toy"])
+            self.cat_pager.set(key, self._cat_blocks(sel), self.wrap, SCREEN_W - 16, panel_h, group=sel)
+            self.cat_pager.draw(self, 8, panel_y)
+            self.pager_regs.append((self.cat_pager, 8, panel_y, SCREEN_W - 16, panel_h))
+        else:
+            self.tx(14, panel_y + 6, "猫をタップしてね" if met else "庭にエサとおもちゃを置いてみよう", C_SUB)
+
+    def _cat_blocks(self, cid):
+        """プロフィールの中身。伏せ字(まだ明かされていないお宝)は、本当の文と同じ長さの「？」で組む。
+        こうすると、あとで明かされても行の数や位置が変わらない。
+        【フェーズ1・2】性別・満腹度・性格を追加（数値は見せず、言葉で表現）。"""
+        spec, c = game.CATS[cid], self.state["cats"][cid]
+        if c["in_yard"]:
+            if c["toy"]:
+                now = "{0}で遊んでいる".format(game.TOYS[c["toy"]]["name"])
+            else:
+                now = "のんびりしている"
+        else:
+            now = "今はいない"
+        treasure = spec["treasure"] if c["given_treasure"] else "？" * len(spec["treasure"])
+
+        # 性別マーク
+        sex_mark = "♂" if spec["sex"] == "m" else "♀"
+
+        # 満腹度を言葉で表現（数値は見せない）
+        fullness = c["fullness"]
+        if fullness < 0.2:
+            fullness_text = "お腹がすいている"
+        elif fullness < 0.5:
+            fullness_text = "少しお腹がすいている"
+        elif fullness < 0.8:
+            fullness_text = "満足している"
+        else:
+            fullness_text = "お腹がいっぱい"
+
+        # 性格を言葉で表現
+        traits = spec["traits"]
+        personality = []
+        if traits["appetite"] >= 0.7:
+            personality.append("食いしん坊")
+        elif traits["appetite"] <= 0.3:
+            personality.append("少食")
+        if traits["friendly"] >= 0.7:
+            personality.append("人好き")
+        elif traits["friendly"] <= 0.3:
+            personality.append("シャイ")
+        if traits["wary"] >= 0.7:
+            personality.append("警戒心が強い")
+        elif traits["wary"] <= 0.3:
+            personality.append("警戒心が薄い")
+        personality_text = " / ".join(personality) if personality else "ふつう"
+
+        return [("{0} {1}".format(sex_mark, spec["name"]), C_ACCENT),
+                (spec["desc"], C_TEXT),
+                ("性格: " + personality_text, C_SUB),
+                ("状態: " + fullness_text + " / " + now, C_SUB),
+                ("お宝:「{0}」".format(treasure), C_ACCENT if c["given_treasure"] else C_DIM)]
+
+    # ---- ヘルプ
+    def draw_help(self):
+        """ヘルプもタイプライターで読み上げる。長いぶんはページに分かれ、▼ が点滅したらタップで次へ。"""
+        x, y, w = 0, HEADER_H + 2, SCREEN_W
+        h = TAB_Y - 4 - y
+        blocks = [(text, C_TEXT) for text in HELP_LINES]
+        blocks.append(("", C_TEXT))
+        blocks.append(("自動でセーブしています", C_GOOD) if self.save_path else ("この環境ではセーブできません", C_BAD))
+        self.help_pager.set(("help", bool(self.save_path)), blocks, self.wrap, w, h)
+        self.help_pager.draw(self, x, y)
+        self.pager_regs.append((self.help_pager, x, y, w, h))
+
+
+if not os.environ.get("NEKOATSUME_NO_AUTORUN"):   # テストから import するときだけ自動起動を止める
+    App()
