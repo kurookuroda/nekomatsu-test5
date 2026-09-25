@@ -900,7 +900,7 @@ class App:
         if it["kind"] == "toy" and it["size"] > 1:
             info += "(庭を{0}マス使う)".format(it["size"])
         if it["kind"] == "food":
-            info += "(量{0})".format(it["minutes"])
+            info += "(量{0})".format(it["amount"])
         return info
 
     def select_shop(self, item_id):
