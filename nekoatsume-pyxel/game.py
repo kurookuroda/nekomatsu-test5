@@ -70,9 +70,9 @@ def _toy(name, cost, cur, size, desc):
             "size": size, "desc": desc}
 
 
-def _food(name, cost, cur, minutes, tags, desc):
+def _food(name, cost, cur, amount, tags, desc):
     return {"kind": "food", "name": name, "cost": cost, "cur": cur,
-            "minutes": minutes, "tags": tags, "desc": desc}
+            "amount": amount, "tags": tags, "desc": desc}
 
 
 def _cat(name, desc, treasure, **opts):
@@ -404,9 +404,7 @@ def advance(state, now=None):
     import time
     if now is None:
         now = int(time.time())
-    print(f"[DEBUG advance] before sync: food={state.get('food')}, remaining={state.get('food_remaining')}, place={state.get('current_place')}")
     _sync_from_current_place(state)
-    print(f"[DEBUG advance] after sync: food={state.get('food')}, remaining={state.get('food_remaining')}")
 
     last = state.get("last_advance", now)
     elapsed = now - last
@@ -458,7 +456,6 @@ def advance(state, now=None):
                 appetite = spec["traits"]["appetite"]
                 if appetite < 0.5:
                     if random.random() >= appetite * 2:
-                        print(f"[DEBUG advance] {cid} skipped (appetite={appetite})")
                         continue
                     eat = 1
                 elif appetite >= 0.8:
@@ -466,14 +463,12 @@ def advance(state, now=None):
                 else:
                     eat = 1
                 total_eat += eat
-                print(f"[DEBUG advance] {cid} ate {eat}, total_eat={total_eat}")
                 c = state["cats"][cid]
                 c["fullness"] = min(1.0, c["fullness"] + 0.08 * eat)
             old_remaining = state["food_remaining"]
             state["food_remaining"] = max(0, state["food_remaining"] - total_eat)
-            print(f"[DEBUG advance] food_remaining {old_remaining} -> {state['food_remaining']} (total_eat={total_eat})")
         else:
-            print(f"[DEBUG advance] food logic skipped")
+            pass  # food logic skipped
 
         # ---- 満腹度減少 ----
         for c in state["cats"].values():
