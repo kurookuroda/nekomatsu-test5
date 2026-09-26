@@ -92,7 +92,7 @@ def _cat(name, desc, treasure, **opts):
         "affinity": opts.get("affinity", {}),
         "habitat": opts.get("habitat", ["garden"]),
         "strength": opts.get("strength", 5),
-        "entry_chance": opts.get("entry_chance", 0.1),
+        "entry_chance": opts.get("entry_chance", 0.5),
         "time_limit": opts.get("time_limit", 30),
         "fav_toy": opts.get("fav_toy", None),
         "exclusive": opts.get("exclusive", False),
