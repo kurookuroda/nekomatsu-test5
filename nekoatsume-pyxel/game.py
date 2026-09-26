@@ -8,7 +8,7 @@ UI からはこのモジュールの関数だけを呼び出すこと。
 - _food() に tags 引数を追加（エサの好みタグ）
 - _cat() で個性辞書を正規化（sex/traits/taste/affinity/habitat の既定値補完）
 - 猫の状態 fullness/trust/happiness を追加
-- advance() で taste_score を使って来訪率を補正
+- advance() で taste_score を使って来って来訪率を補正
 - エサの減り方を「時間で1ずつ」から「庭にいる猫が食べた分」に変更
 - CATALOG_VERSION = 3、loads() でバージョン3へのマイグレーション
 
@@ -29,6 +29,12 @@ UI からはこのモジュールの関数だけを呼び出すこと。
 - フェーズ2互換: state['yard'] / state['food'] は current_place の場所と同期
 - CATALOG_VERSION = 5
 
+【フェーズ4変更点】
+- 全場所を同時に advance() で処理（マルチプレイス対応）
+- 猫の状態に place フィールド追加（どの場所にいるか記録）
+- 各場所のエサ・おもちゃ・スペースで独立して猫を処理
+- CATALOG_VERSION = 6
+
 SPACE = 6  # 庭のマス数（フェーズ2互換、場所ごとの space を優先）、loads() でバージョン5へのマイグレーション
 """
 
@@ -42,7 +48,7 @@ import catalog
 # カタログデータ(起動時に load_catalog() で読み込まれる)
 # ---------------------------------------------------------------------------
 
-CATALOG_VERSION = 5
+CATALOG_VERSION = 6
 
 SPACE = 6  # 庭のマス数（フェーズ2互換、場所ごとの space を優先）
 
@@ -238,6 +244,12 @@ def loads(s, now):
                 }
         data["version"] = 5
 
+    if ver < 6:
+        # place フィールド追加
+        for c in data.get("cats", {}).values():
+            c.setdefault("place", None)
+        data["version"] = 6
+
     cats = data.setdefault("cats", {})
     for cid in CATS:
         if cid not in cats:
@@ -281,6 +293,7 @@ def new_state(now):
                 "total_time": 0,
                 "time_in_yard": 0,
                 "in_yard": False,
+                "place": None,
                 "toy": None,
                 "fullness": 0.5,
                 "trust": 0.0,
@@ -379,22 +392,6 @@ def switch_place(state, pid):
     _sync_from_current_place(state)
     return Result(True, PLACES[pid]["name"] + "に移動した", "ok")
 
-def set_food(state, food_id, force=False):
-    if not force:
-        if state.get("food"):
-            return Result(False, "すでにエサが置いてあります。置き換えますか？", "need_confirm")
-    if state["food_stock"].get(food_id, 0) <= 0:
-        return Result(False, "持ってません", "not_owned")
-    state["food_stock"][food_id] -= 1
-    state["food"] = food_id
-    state["food_remaining"] = FOODS.get(food_id, {}).get("amount", 0) if food_id else 0
-    pid = state["current_place"]
-    if pid in state["places"]:
-        state["places"][pid]["food"] = state["food"]
-        state["places"][pid]["food_remaining"] = state["food_remaining"]
-    return Result(True, FOODS[food_id]["name"] + "を置いた", "ok")
-
-
 
 # ---------------------------------------------------------------------------
 # ゲーム進行
@@ -404,7 +401,6 @@ def advance(state, now=None):
     import time
     if now is None:
         now = int(time.time())
-    _sync_from_current_place(state)
 
     last = state.get("last_advance", now)
     elapsed = now - last
@@ -415,137 +411,139 @@ def advance(state, now=None):
     visits = 0
     bonus_treasure = None
 
-    pid = state["current_place"]
-    place = PLACES.get(pid)
-    space = place["space"] if place else 6
-
-    food_id = state.get("food")
-    food_tags = FOODS.get(food_id, {}).get("tags", {}) if food_id else {}
-
-    # アクター出現判定
-    for aid, actor in ACTORS.items():
-        if pid not in actor["habitat"]:
+    # アクターの初期出現判定（各場所で一度だけ）
+    for pid, place in PLACES.items():
+        requires = place.get("requires")
+        if requires and not meets(state, requires):
             continue
-        if not meets(state, actor["requires"]):
-            continue
-        astate = state["actor_states"].setdefault(aid, {
-            "met": False, "in_place": False, "timer": 0, "reward_given": False,
-        })
-        if not astate["met"]:
-            astate["met"] = True
-            state["met_actors"].add(aid)
-            events.append(("actor_met", aid))
-        if not astate["in_place"]:
-            astate["in_place"] = True
-            astate["timer"] = 0
-            events.append(("actor_arrive", aid))
+
+        for aid, actor in ACTORS.items():
+            if pid not in actor["habitat"]:
+                continue
+            if not meets(state, actor["requires"]):
+                continue
+            astate = state["actor_states"].setdefault(aid, {
+                "met": False, "in_place": False, "timer": 0, "reward_given": False,
+            })
+            if not astate["met"]:
+                astate["met"] = True
+                state["met_actors"].add(aid)
+                events.append(("actor_met", aid))
+            if not astate["in_place"]:
+                astate["in_place"] = True
+                astate["timer"] = 0
+                events.append(("actor_arrive", aid))
 
     for _ in range(ticks):
-        # ---- アクタータイマー ----
-        for aid, astate in state["actor_states"].items():
-            if astate.get("in_place"):
-                astate["timer"] = astate.get("timer", 0) + 1
+        # ===== 各場所の処理 =====
+        for pid, place in PLACES.items():
+            requires = place.get("requires")
+            if requires and not meets(state, requires):
+                continue
 
-        # ---- エサの減り ----
-        eaters = [cid for cid, c in state["cats"].items() if c["in_yard"]]
-        if food_id and state["food_remaining"] > 0:
-            total_eat = 0
-            for cid in eaters:
+            p = state["places"][pid]
+            food_id = p.get("food")
+            food_tags = FOODS.get(food_id, {}).get("tags", {}) if food_id else {}
+            space = place["space"]
+            yard = p.get("yard", [])
+
+            # ---- アクタータイマー ----
+            for aid, astate in state["actor_states"].items():
+                actor = ACTORS.get(aid)
+                if actor and pid in actor["habitat"] and astate.get("in_place"):
+                    astate["timer"] = astate.get("timer", 0) + 1
+
+            # ---- エサの減り（この場所にいる猫だけ） ----
+            eaters = [cid for cid, c in state["cats"].items()
+                      if c["in_yard"] and c.get("place") == pid]
+            if food_id and p.get("food_remaining", 0) > 0:
+                total_eat = 0
+                for cid in eaters:
+                    spec = CATS[cid]
+                    appetite = spec["traits"]["appetite"]
+                    if appetite < 0.5:
+                        if random.random() >= appetite * 2:
+                            continue
+                        eat = 1
+                    elif appetite >= 0.8:
+                        eat = 2
+                    else:
+                        eat = 1
+                    total_eat += eat
+                    c = state["cats"][cid]
+                    c["fullness"] = min(1.0, c["fullness"] + 0.08 * eat)
+                p["food_remaining"] = max(0, p["food_remaining"] - total_eat)
+
+            # ---- 猫の滞在時間・退場（この場所にいる猫だけ） ----
+            for cid, c in list(state["cats"].items()):
+                if not c["in_yard"] or c.get("place") != pid:
+                    continue
+                c["time_in_yard"] += 1
+                c["total_time"] += 1
                 spec = CATS[cid]
-                appetite = spec["traits"]["appetite"]
-                if appetite < 0.5:
-                    if random.random() >= appetite * 2:
-                        continue
-                    eat = 1
-                elif appetite >= 0.8:
-                    eat = 2
-                else:
-                    eat = 1
-                total_eat += eat
-                c = state["cats"][cid]
-                c["fullness"] = min(1.0, c["fullness"] + 0.08 * eat)
-            old_remaining = state["food_remaining"]
-            state["food_remaining"] = max(0, state["food_remaining"] - total_eat)
-        else:
-            pass  # food logic skipped
+                limit = spec["time_limit"]
 
-        # ---- 満腹度減少 ----
+                if c["time_in_yard"] >= limit:
+                    c["in_yard"] = False
+                    c["place"] = None
+                    c["toy"] = None
+                    c["time_in_yard"] = 0
+                    amount = random.randint(1, 3)
+                    if spec["traits"]["friendly"] > 0.6:
+                        amount += 1
+                    state["pending_money"].append((cid, amount, "s"))
+                    if random.random() < 0.1:
+                        state["pending_treasures"].append(cid)
+                        bonus_treasure = cid
+                    events.append(("leave", cid, pid))
+
+            # ---- 猫の来訪（この場所のエサ・スペース・おもちゃで判定） ----
+            if food_id and p.get("food_remaining", 0) > 0:
+                used = sum(TOYS[t]["size"] for t in yard)
+                free_space = space - used
+
+                for cid, spec in CATS.items():
+                    c = state["cats"][cid]
+                    if c["in_yard"]:
+                        continue
+                    if pid not in spec["habitat"]:
+                        continue
+
+                    base_chance = spec["entry_chance"]
+                    taste = catalog.taste_score(spec["taste"], food_tags)
+                    fullness_factor = 1 - c["fullness"] * 0.6
+                    chance = base_chance * taste * fullness_factor
+
+                    if free_space <= 0:
+                        continue
+
+                    if random.random() < chance:
+                        toy = None
+                        if yard:
+                            used_toys = {other["toy"] for other in state["cats"].values()
+                                         if other["in_yard"] and other["toy"] and other.get("place") == pid}
+                            available = [t for t in yard if t not in used_toys]
+                            if available:
+                                fav = spec.get("fav_toy")
+                                if fav and fav in available:
+                                    toy = fav
+                                else:
+                                    toy = random.choice(available)
+                        c["in_yard"] = True
+                        c["place"] = pid
+                        if not c["met"]:
+                            gain_level(state, 1, "met_new_cat")
+                        c["met"] = True
+                        c["time_in_yard"] = 0
+                        c["toy"] = toy
+                        c["trust"] = min(1.0, c["trust"] + 0.1)
+                        visits += 1
+                        free_space -= 1
+                        events.append(("arrive", cid, pid))
+
+        # ---- 満腹度減少（全員・1回だけ） ----
         for c in state["cats"].values():
             c["fullness"] = max(0.0, c["fullness"] - 0.015)
-
-        # ---- 猫の滞在時間 ----
-        for cid, c in list(state["cats"].items()):
-            if not c["in_yard"]:
-                continue
-            c["time_in_yard"] += 1
-            c["total_time"] += 1
-            spec = CATS[cid]
-            limit = spec["time_limit"]
-
-            if c["time_in_yard"] >= limit:
-                c["in_yard"] = False
-                c["toy"] = None
-                c["time_in_yard"] = 0
-                amount = random.randint(1, 3)
-                if spec["traits"]["friendly"] > 0.6:
-                    amount += 1
-                state["pending_money"].append((cid, amount, "s"))
-                if random.random() < 0.1:
-                    state["pending_treasures"].append(cid)
-                    bonus_treasure = cid
-                events.append(("leave", cid))
-
-        # ---- 猫の来訪 ----
-        if food_id and state["food_remaining"] > 0:
-            # 【修正】space_used(state) を呼ぶと内部で _sync_from_current_place() が走り、
-            # このtick中にまだ places へ書き戻していない food_remaining の減少分が
-            # 古い値で上書きされてしまうため、直接計算する。
-            used = sum(TOYS[t]["size"] for t in state["yard"])
-            free_space = space - used
-
-            for cid, spec in CATS.items():
-                c = state["cats"][cid]
-                if c["in_yard"]:
-                    continue
-                if pid not in spec["habitat"]:
-                    continue
-
-                base_chance = spec["entry_chance"]
-                taste = catalog.taste_score(spec["taste"], food_tags)
-                fullness_factor = 1 - c["fullness"] * 0.6
-                chance = base_chance * taste * fullness_factor
-
-                if free_space <= 0:
-                    continue
-
-                if random.random() < chance:
-                    yard = state["yard"]
-                    toy = None
-                    if yard:
-                        # 他の猫が使っているおもちゃは除外
-                        used_toys = {other["toy"] for other in state["cats"].values()
-                                     if other["in_yard"] and other["toy"]}
-                        available = [t for t in yard if t not in used_toys]
-                        if available:
-                            fav = spec.get("fav_toy")
-                            if fav and fav in available:
-                                toy = fav
-                            else:
-                                toy = random.choice(available)
-                        # available が空なら toy = None（おもちゃなしで来訪）
-                    c["in_yard"] = True
-                    if not c["met"]:
-                        gain_level(state, 1, "met_new_cat")
-                    c["met"] = True
-                    c["time_in_yard"] = 0
-                    c["toy"] = toy
-                    # 猫が来るたびに trust が少し上昇（最大1.0）
-                    c["trust"] = min(1.0, c["trust"] + 0.1)
-                    visits += 1
-                    free_space -= 1
-                    events.append(("arrive", cid))
-
-    _sync_to_current_place(state)
 
     return {"ticks": ticks, "events": events, "visits": visits,
             "bonus_treasure": bonus_treasure,
@@ -643,6 +641,25 @@ def remove_toy(state, toy_id):
     _sync_to_current_place(state)
     return Result(True, "{0}を片付けました".format(TOYS[toy_id]["name"]), "ok")
 
+
+# ---------------------------------------------------------------------------
+# エサ
+# ---------------------------------------------------------------------------
+
+def set_food(state, food_id, force=False):
+    if not force:
+        if state.get("food"):
+            return Result(False, "すでにエサが置いてあります。置き換えますか？", "need_confirm")
+    if state["food_stock"].get(food_id, 0) <= 0:
+        return Result(False, "持ってません", "not_owned")
+    state["food_stock"][food_id] -= 1
+    state["food"] = food_id
+    state["food_remaining"] = FOODS.get(food_id, {}).get("amount", 0) if food_id else 0
+    pid = state["current_place"]
+    if pid in state["places"]:
+        state["places"][pid]["food"] = state["food"]
+        state["places"][pid]["food_remaining"] = state["food_remaining"]
+    return Result(True, FOODS[food_id]["name"] + "を置いた", "ok")
 
 
 # ---------------------------------------------------------------------------
@@ -761,7 +778,7 @@ def event_text(ev):
 
 
 def cat_state_text(cid, state):
-    """猫の外から見た描写を返す（フレーム間で安定）"""
+    """猫の外から見た描写を返す（フレーム間で安定"""
     c = state["cats"][cid]
     fullness = c["fullness"]
     toy = c.get("toy")
@@ -806,7 +823,6 @@ def pet(state, cid):
         return Result(False, "今はいません", "not_here")
     if c["trust"] < 0.8:
         return Result(False, "まだ慣れていないようだ", "low_trust")
-    # 撫でると happiness が上昇し、trust も少し上がる
     c["happiness"] = min(1.0, c["happiness"] + 0.15)
     c["trust"] = min(1.0, c["trust"] + 0.05)
     return Result(True, "{0}を撫でた。気持ちよさそうにしている".format(CATS[cid]["name"]), "ok")
