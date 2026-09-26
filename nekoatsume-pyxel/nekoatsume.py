@@ -791,7 +791,12 @@ class App:
         if result.ok:
             self.save()
 
-    # ---- ショップ
+    # ---- ショップ    def open_bag(self, kind):
+        self.screen = "bag"
+        self.sub["bag"] = 0 if kind == "toy" else 1  # 0=おもちゃ, 1=エサ
+        self.hits, self.areas, self.pager_regs, self.press = [], [], [], None
+
+
     def sub_tabs(self, screen, y=20):
         """もちものの種別タブ。最初は何も押されていない(=すべて表示)。押したタブをもう一度押すと解除される。"""
         for i, label in enumerate(("おもちゃ", "エサ")):
