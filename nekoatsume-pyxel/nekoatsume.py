@@ -35,7 +35,7 @@ class App:
         # 画面の状態
         self.screen = "yard"
         self.sub = {"bag": None}               # もちものの種別タブ。None=何も押していない(すべて) 0=おもちゃ 1=エサ
-        self.selected = {"shop": None, "cats": None}
+        self.selected = {"shop": None, "cats": None, "yard": None}
         self.scroll = {}
         self.log = []                          # [{"full": 折り返し済みテキスト, "revealed": int}]
         self.log_timer = 0
@@ -576,13 +576,27 @@ class App:
         # 【フェーズ1・2】庭にいる猫の外見描写を表示
         in_yard = [(cid, s["cats"][cid]) for cid in s["cats"] if s["cats"][cid]["in_yard"]]
         y_cat_bottom = 34  # エサ表示の下
+        selected_cat = self.selected.get("yard")
         if in_yard:
             y_cat = 34
             for cid, c in in_yard:
                 name = game.CATS[cid]["name"]
                 desc = game.cat_state_text(cid, s)
-                self.tx(8, y_cat, "{0}が{1}".format(name, desc), C_SUB)
+                # 選択の猫は色を変える
+                color = C_ACCENT if cid == selected_cat else C_SUB
+                self.tx(8, y_cat, "{0}が{1}".format(name, desc), color)
+                # タップで選択
+                self.hit(8, y_cat, SCREEN_W - 16, LINE_H, lambda cid=cid: self.select("yard", cid))
                 y_cat += LINE_H
+            # 選択中の猫がいれば、撫でるボタンを表示
+            if selected_cat and selected_cat in [cid for cid, _ in in_yard]:
+                can_pet = s["cats"][selected_cat]["trust"] >= 0.8
+                trust = s["cats"][selected_cat]["trust"]
+                btn_text = "♥ 撫でる" if can_pet else "♡ 撫でる(trust {:.1f}/0.8)".format(trust)
+                self.button(8, y_cat, 100, 16, btn_text,
+                            lambda: self.try_pet(selected_cat),
+                            enabled=can_pet)
+                y_cat += 20
             y_cat_bottom = y_cat  # 猫表示の最終y位置
 
         y = y_cat_bottom + 4  # 猫表示の下からおもちゃリストを開始
@@ -743,6 +757,12 @@ class App:
         texts = ["{0}が「{1}」をくれました!".format(game.CATS[c]["name"], game.CATS[c]["treasure"]) for c in got]
         self.show_toast("\n".join(texts), C_ACCENT)
         self.save()
+
+    def try_pet(self, cid):
+        result = game.pet(self.state, cid)
+        self.show_toast(result.msg, C_GOOD if result.ok else C_BAD)
+        if result.ok:
+            self.save()
 
     # ---- ショップ
     def sub_tabs(self, screen, y=20):
