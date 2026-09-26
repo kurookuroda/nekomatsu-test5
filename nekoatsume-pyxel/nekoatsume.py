@@ -365,9 +365,16 @@ class App:
 
     def goto(self, name):
         if name != self.screen:
-            self.screen = name
+            if name in game.PLACES:
+                self.state["current_place"] = name
+                self.screen = "yard"
+            elif name == "yard":
+                self.state["current_place"] = "garden"
+                self.screen = "yard"
+            else:
+                self.screen = name
             self.hits, self.areas, self.pager_regs, self.press = [], [], [], None
-            if name == "help":
+            if self.screen == "help":
                 self.help_pager.key = None          # ヘルプは開くたびに、はじめから読み上げる
 
     # ------------------------------------------------------------ 一文字ずつ表示(タイプライター)
