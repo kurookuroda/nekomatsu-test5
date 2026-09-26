@@ -16,7 +16,7 @@ ID は英数字とアンダースコア(セーブデータのキーになるの�
   データ側: "unlocks": "obaachan" (actor ID) または "unlocks": "stage:mansion2"
   実装側: apply_reward() が flags.add(f"unlocked_{unlocks}") に変換して state に書き込む。
   例: "obaachan" → flag "unlocked_obaachan" を state["flags"] に追加
-       "stage:mansion2" → flag "unlocked_stage_mansion2" を state["flags"] に追加
+       "stage:mansion2" → flag "unlocked_stage:mansion2" を state["flags"] に追加(コロンはそのまま残る)
   ※ flag の綴りをデータ側に持たせず、ID / stage:xxx のまま実装側で変換する。
   ※ ACTORS の requires 側は変換後の flag 名("unlocked_obaachan")を参照する。
 - validate_world() は outcome/unlocks の "stage:xxx" と "flag:xxx" を検証対象に含める。
@@ -154,7 +154,7 @@ GOODS = [
 # 【unlocks の取り決め】
 #   データ側: "unlocks": "obaachan" (actor ID) または "unlocks": "stage:mansion2"
 #   実装側(apply_reward): flags.add(f"unlocked_{unlocks}") で state["flags"] に書き込む
-#   例: "obaachan" → "unlocked_obaachan" / "stage:mansion2" → "unlocked_stage_mansion2"
+#   例: "obaachan" → "unlocked_obaachan" / "stage:mansion2" → "unlocked_stage:mansion2"(コロンはそのまま残る)
 #   requires 側は変換後の flag 名を参照: {"flag": "unlocked_obaachan"}
 ACTORS = [
     ("catseye_a", "visitor", "キャツアイの誰か",
@@ -183,8 +183,8 @@ ACTORS = [
 #   解放条件: requires 辞書または None(最初から解放)
 PLACES = [
     ("garden", "庭", 6, "puddle", None),
-    ("mansion", "屋敷", 12, "pond", {"flag": "unlocked_stage_mansion"}),
-    ("mansion2", "屋敷の奥", 10, "pond", {"flag": "unlocked_stage_mansion2"}),
+    ("mansion", "屋敷", 12, "pond", {"flag": "unlocked_stage:mansion"}),
+    ("mansion2", "屋敷の奥", 10, "pond", {"flag": "unlocked_stage:mansion2"}),
 ]
 
 
