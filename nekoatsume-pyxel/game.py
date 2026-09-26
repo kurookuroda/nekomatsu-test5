@@ -448,7 +448,6 @@ def advance(state, now=None):
 
         # ---- エサの減り ----
         eaters = [cid for cid, c in state["cats"].items() if c["in_yard"]]
-        print(f"[DEBUG advance] tick food_id={food_id}, remaining={state['food_remaining']}, eaters={eaters}")
         if food_id and state["food_remaining"] > 0:
             total_eat = 0
             for cid in eaters:
@@ -498,7 +497,10 @@ def advance(state, now=None):
 
         # ---- 猫の来訪 ----
         if food_id and state["food_remaining"] > 0:
-            used = space_used(state)
+            # 【修正】space_used(state) を呼ぶと内部で _sync_from_current_place() が走り、
+            # このtick中にまだ places へ書き戻していない food_remaining の減少分が
+            # 古い値で上書きされてしまうため、直接計算する。
+            used = sum(TOYS[t]["size"] for t in state["yard"])
             free_space = space - used
 
             for cid, spec in CATS.items():
