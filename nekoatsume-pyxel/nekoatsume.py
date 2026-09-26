@@ -791,7 +791,7 @@ class App:
         if result.ok:
             self.save()
 
-    # ---- ショップ    def open_bag(self, kind):
+    def open_bag(self, kind):
         self.screen = "bag"
         self.sub["bag"] = 0 if kind == "toy" else 1  # 0=おもちゃ, 1=エサ
         self.hits, self.areas, self.pager_regs, self.press = [], [], [], None
