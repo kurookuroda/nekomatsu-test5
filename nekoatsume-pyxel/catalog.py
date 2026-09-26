@@ -23,7 +23,7 @@ ID は英数字とアンダースコア(セーブデータのキーになるの�
 
 【タグ辞書の取り決め】
 - エサタグ: meat(肉), fish(魚), grain(穀物), grass(植物/草)
-- 猫の taste キー: meat, fish, grass  (grain は現状猫側に対応キーなし)
+- 猫の taste キー: meat, fish, grass  (grain は現状猫側に対応キなし)
   ※ grain は穀物タグ。現状の猫には grain 好みがいないために、taste_score=0 となる。
     将来的に grain 好みの猫を追加する場合は taste={"grain": ...} を使うこと。
   ※ dry_food は {"meat": 0.5, "grain": 0.5}。grain 好みの猫がいない間は meat 成分のみが採用される。
@@ -146,7 +146,7 @@ GOODS = [
 #     habitat: [場所ID, ...]      出現しうる場所のリスト
 #     requires: {条件}            meets() に渡す出現条件辞書
 #     gifts: [(outcome, 重み), ...]  visitor が帰るときの抽選
-#     wants: {タグ: 重み}         person が好む物のタグ
+#     wants: {タグ: 重み}         person が好む物のグ
 #     one_time_reward: {..., "unlocks": 次のID}
 #         最初に wants を満たす物を渡されたときだけ発動
 #   outcome の形式: "item:xxx" / "creature:xxx" / "flag:xxx" / "stage:xxx"
@@ -159,7 +159,7 @@ GOODS = [
 ACTORS = [
     ("catseye_a", "visitor", "キャツアイの誰か",
      "使い古しの電子機器を引き取って売り買いしている。お金にはこだわらず、猫を愛している。",
-     {"habitat": ["mansion"], "requires": {"level": 5},
+     {"habitat": ["garden"], "requires": {"level": 5},
       # gifts は演出用（何かもらえる雰囲気）。鎖を進める必須アイテムは one_time_reward で保証
       "gifts": [("item:smartphone", 0.5), ("item:laptop", 0.2), ("item:sweets", 0.3)],
       "one_time_reward": {"item": "smartphone", "unlocks": "stage:mansion"}}),
@@ -178,7 +178,7 @@ ACTORS = [
       "one_time_reward": {"item": "amulet", "unlocks": "stage:mansion2"}}),
 ]
 
-# 場所: (ID, 表示名, マス数, 水辺の種類, 解放条件)
+# 場所: (ID, 表示名, マ数, 水辺の種類, 解放条件)
 #   水辺の種類: "puddle"(小水たまり) / "pond"(池) / "none"(水辺なし)
 #   解放条件: requires 辞書または None(最初から解放)
 PLACES = [
@@ -335,7 +335,7 @@ CAT_STATE_DESCRIPTIONS = {
         "しっぽを小さくっている",
         "のんびりしている",
         "あくびをしている",
-        "毛づくろいをしている",
+        "毛づくろいをしてる",
         "くるりと丸まっている",
     ],
     "content": [
@@ -366,7 +366,7 @@ CAT_TOY_DESCRIPTIONS = {
     "cardboard_box": [
         "箱の中に入っている",
         "箱の縁で爪を研いでいる",
-        "箱から顔だけ出している",
+        "箱からだけ出している",
     ],
     "scratching_post": [
         "爪とぎで爪を研いでいる",
