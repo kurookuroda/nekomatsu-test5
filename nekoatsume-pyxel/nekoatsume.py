@@ -296,7 +296,8 @@ class App:
             elif keys & {"KEY_LEFT", "KEY_BACKSPACE"}:
                 self.message["pager"].prev_page()
             return
-        for i, (name, _label) in enumerate(TABS):
+        tabs = self._get_tabs()
+        for i, (name, _label) in enumerate(tabs):
             if "KEY_%d" % (i + 1) in keys:
                 self.goto(name)
         if keys & {"KEY_RETURN", "KEY_SPACE", "KEY_RIGHT"}:
@@ -487,17 +488,28 @@ class App:
                     if not active:
                         self.hit(x, 0, w, HEADER_H, lambda pid=p: self.do_switch_place(pid))
                     x += w + 8
-        title = dict(TABS)[self.screen]
+        title = dict(self._get_tabs())[self.screen]
         self.tx_right(SCREEN_W - 6, 3, title, C_SUB)
 
     def draw_tabs(self):
-        w = SCREEN_W // len(TABS)
+        w = SCREEN_W // len(tabs)
         pending = bool(self.state["pending_money"] or self.state["pending_treasures"])
-        for i, (name, label) in enumerate(TABS):
+        for i, (name, label) in enumerate(tabs):
             self.button(i * w, TAB_Y, w, TAB_H, label, lambda n=name: self.goto(n), active=(name == self.screen))
             if name == "yard" and pending and self.screen != "yard":
                 pyxel.circ(i * w + w - 7, TAB_Y + 6, 3, C_ACCENT)   # 受け取れるものがある印
 
+
+    def _get_tabs(self):
+        """動的タブ生成。解放済みの場所をタブに含める。"""
+        tabs = [("yard", "ねこ")]
+        for pid, place in game.PLACES.items():
+            req = place.get("requires")
+            if req and not game.meets(self.state, req):
+                continue
+            tabs.append((pid, place["name"]))
+        tabs.extend([("cats", "図鑑"), ("shop", "ショッ"), ("bag", "もちもの"), ("help", "ヘルプ")])
+        return tabs
     def draw_toast(self):
         col = self.toast["col"]
         total_lines = self.toast_tw.text.split("\n")
@@ -568,28 +580,33 @@ class App:
     # ---- にわ
     def draw_yard(self):
         s = self.state
-        if s["food"]:
-            self.tx(8, 22, "エサ: {0} 残り{1}".format(game.FOODS[s["food"]]["name"], s["food_remaining"]), C_GOOD)
-        else:
-            self.tx(8, 22, "エサがありません(もちもの→エサ)", C_BAD)
+        pid = s["current_place"]
+        p = s["places"][pid]
+        food_id = p["food"]
+        food_remaining = p["food_remaining"]
+        yard = p["yard"]
 
-        # 【フェーズ1・2】庭にいる猫の外見描写を表示
-        in_yard = [(cid, s["cats"][cid]) for cid in s["cats"] if s["cats"][cid]["in_yard"]]
-        y_cat_bottom = 34  # エサ表示の下
+        place_name = game.PLACES[pid]["name"]
+        self.tx(8, 22, place_name, C_ACCENT)
+
+        if food_id:
+            self.tx(8, 36, "エサ: {0} 残り{1}".format(game.FOODS[food_id]["name"], food_remaining), C_GOOD)
+        else:
+            self.tx(8, 36, "エサがありません(もちもの→エサ)", C_BAD)
+
+        in_this_place = [(cid, s["cats"][cid]) for cid in s["cats"] if s["cats"][cid]["in_yard"] and s["cats"][cid].get("place") == pid]
+        y_cat_bottom = 50
         selected_cat = self.selected.get("yard")
-        if in_yard:
-            y_cat = 34
-            for cid, c in in_yard:
+        if in_this_place:
+            y_cat = 50
+            for cid, c in in_this_place:
                 name = game.CATS[cid]["name"]
                 desc = game.cat_state_text(cid, s)
-                # 選択の猫は色を変える
                 color = C_ACCENT if cid == selected_cat else C_SUB
                 self.tx(8, y_cat, "{0}が{1}".format(name, desc), color)
-                # タップで選択
                 self.hit(8, y_cat, SCREEN_W - 16, LINE_H, lambda cid=cid: self.select("yard", cid))
                 y_cat += LINE_H
-            # 選択中の猫がいれば、撫でるボタンを表示
-            if selected_cat and selected_cat in [cid for cid, _ in in_yard]:
+            if selected_cat and selected_cat in [cid for cid, _ in in_this_place]:
                 can_pet = s["cats"][selected_cat]["trust"] >= 0.8
                 trust = s["cats"][selected_cat]["trust"]
                 btn_text = "♥ 撫でる" if can_pet else "♡ 撫でる(trust {:.1f}/0.8)".format(trust)
@@ -597,15 +614,15 @@ class App:
                             lambda: self.try_pet(selected_cat),
                             enabled=can_pet)
                 y_cat += 20
-            y_cat_bottom = y_cat  # 猫表示の最終y位置
+            y_cat_bottom = y_cat
 
-        y = y_cat_bottom + 4  # 猫表示の下からおもちゃリストを開始
+        y = y_cat_bottom + 4
         yard_bottom = y
-        if not s["yard"]:
-            for i, line in enumerate(self.wrap("庭にはおもちゃがありません。ショップで買って、もちものから置こう", SCREEN_W - 16)):
+        if not yard:
+            for i, line in enumerate(self.wrap("おもちゃがありません。ショップで買って、もちものから置こう", SCREEN_W - 16)):
                 self.tx(8, y + i * LINE_H, line, C_SUB)
                 yard_bottom = y + (i + 1) * LINE_H
-        for i, toy in enumerate(s["yard"]):
+        for i, toy in enumerate(yard):
             spec = game.TOYS[toy]
             self.tx(8, y + i * ROW_H, spec["name"], C_TEXT)
             occ = game.occupants(s, toy)
@@ -617,28 +634,37 @@ class App:
                 self.tx_right(SCREEN_W - 8, y + i * ROW_H, "(空き)", C_DIM)
             yard_bottom = y + (i + 1) * ROW_H
 
-        # 【フェーズ3】アクター表示
         yard_bottom = self._draw_actors(yard_bottom + 6)
 
-        # 「できごと」見出し→区切り線→ログ、の順に、フォントの実寸に合わせて積み上げる
-        # (ボタン行の上で必ず収まるよう、はみ出したらログの行数を減らす)
         buttons_y = 194
         label_y = yard_bottom + 6
         line_y = label_y + FONT_SIZE + 3
         log_y = line_y + 5
-        max_log_lines = max(1, (buttons_y - 4 - log_y) // LINE_H)
-
         self.tx(8, label_y, "できごと", C_SUB)
         pyxel.line(8, line_y, SCREEN_W - 8, line_y, C_DIM)
-        for i, line in enumerate(self.visible_log(max_log_lines)):
-            self.tx(10, log_y + i * LINE_H, line, C_TEXT)
+        n = len(self.log)
+        maxs = max(0, n * LINE_H - (buttons_y - 4 - log_y))
+        off = min(max(self.scroll.get("log", 0), 0), maxs)
+        self.scroll["log"] = off
+        self.areas.append(("log", 8, log_y, SCREEN_W - 16, buttons_y - 4 - log_y, maxs))
+        pyxel.clip(8, log_y, SCREEN_W - 16, buttons_y - 4 - log_y)
+        first = int(off // LINE_H)
+        for i in range(first, min(n, first + (buttons_y - 4 - log_y) // LINE_H + 2)):
+            entry = self.log[n - 1 - i]
+            text = entry["full"]
+            revealed = entry["revealed"]
+            visible = text[:revealed] if revealed < len(text) else text
+            self.tx(8, log_y + i * LINE_H - int(off), visible, C_TEXT)
+        pyxel.clip()
+        if maxs > 0:
+            total = maxs + (buttons_y - 4 - log_y)
+            bar_h = max(10, (buttons_y - 4 - log_y) * (buttons_y - 4 - log_y) // total)
+            bar_y = log_y + ((buttons_y - 4 - log_y) - bar_h) * off // maxs
+            pyxel.rect(SCREEN_W - BAR_W - 2, bar_y, BAR_W, bar_h, C_DIM)
 
-        n_money = len(s["pending_money"])
-        n_tre = len(s["pending_treasures"])
-        self.button(8, buttons_y, 118, 20, "さかなを受け取る({0})".format(n_money) if n_money else "さかな なし",
-                    self.do_collect, enabled=bool(n_money))
-        self.button(130, buttons_y, 118, 20, "お宝を受け取る({0})".format(n_tre) if n_tre else "お宝 なし",
-                    self.do_treasures, enabled=bool(n_tre))
+        self.button(8, buttons_y, 72, 16, "エサを置く", lambda: self.open_bag("food"))
+        self.button(88, buttons_y, 72, 16, "おもちゃを置く", lambda: self.open_bag("toy"))
+
 
     def do_switch_place(self, pid):
         r = game.switch_place(self.state, pid)
