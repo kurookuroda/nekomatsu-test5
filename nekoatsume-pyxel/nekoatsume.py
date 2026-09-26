@@ -492,6 +492,7 @@ class App:
         self.tx_right(SCREEN_W - 6, 3, title, C_SUB)
 
     def draw_tabs(self):
+        tabs = self._get_tabs()
         w = SCREEN_W // len(tabs)
         pending = bool(self.state["pending_money"] or self.state["pending_treasures"])
         for i, (name, label) in enumerate(tabs):
