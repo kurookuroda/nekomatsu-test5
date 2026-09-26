@@ -539,6 +539,8 @@ def advance(state, now=None):
                     c["met"] = True
                     c["time_in_yard"] = 0
                     c["toy"] = toy
+                    # 猫が来るたびに trust が少し上昇（最大1.0）
+                    c["trust"] = min(1.0, c["trust"] + 0.1)
                     visits += 1
                     free_space -= 1
                     events.append(("arrive", cid))
@@ -789,3 +791,22 @@ def cat_state_text(cid, state):
 # ---------------------------------------------------------------------------
 
 load_catalog()
+
+
+# ---------------------------------------------------------------------------
+# 猫とのふれあい
+# ---------------------------------------------------------------------------
+
+def pet(state, cid):
+    """猫を撫でる。trust 0.8以上で解放される。"""
+    if cid not in CATS:
+        return Result(False, "その猫は存在しません", "no_cat")
+    c = state["cats"][cid]
+    if not c["in_yard"]:
+        return Result(False, "今はいません", "not_here")
+    if c["trust"] < 0.8:
+        return Result(False, "まだ慣れていないようだ", "low_trust")
+    # 撫でると happiness が上昇し、trust も少し上がる
+    c["happiness"] = min(1.0, c["happiness"] + 0.15)
+    c["trust"] = min(1.0, c["trust"] + 0.05)
+    return Result(True, "{0}を撫でた。気持ちよさそうにしている".format(CATS[cid]["name"]), "ok")
