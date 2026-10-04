@@ -5,6 +5,7 @@ import statistics
 
 import pytest
 
+import catalog
 import game
 
 T0 = 1_000_000.0
@@ -123,11 +124,293 @@ def test_catchup_is_capped():
     assert r["ticks"] == game.MAX_CATCHUP_TICKS
 
 
-def test_food_runs_out_after_300_ticks():
+def test_food_runs_out_eventually_during_active_play():
+    """フェーズ1: エサはもう「経過時間」では減らない。おもちゃがあって猫が遊びに来る状況が続けば、
+    いずれは食べ尽くされる、という点だけを確認する(何tick目に尽きるかは猫の来訪次第で決まらない)。"""
     s = stocked()
-    r = game.advance(s, T0 + 60 * 300, random.Random(2))
+    r = game.advance(s, T0 + 60 * 600, random.Random(2))
     assert s["food"] == "" and s["food_remaining"] == 0
-    assert any(e[0] == "food_out" for e in r["events"]) or r["ticks"] == 300
+    assert any(e[0] == "food_out" for e in r["events"])
+
+
+def test_food_is_not_consumed_without_cats_in_the_yard():
+    """②エサは時間経過でなく、庭にいる猫が食べた分だけ減る"""
+    s = fresh()
+    s["food_stock"]["dry_food"] = 1
+    game.set_food(s, "dry_food")
+    before = s["food_remaining"]
+    for _ in range(50):                       # おもちゃが無いので、誰も庭に来ない
+        game.tick(s, random.Random(0))
+    assert s["food_remaining"] == before
+
+
+def test_food_is_consumed_by_appetite_and_raises_fullness():
+    """②食べた猫の満腹度が上がり、その分だけエサが減る"""
+    s = fresh()
+    s["owned_toys"].append("rubber_ball")
+    game.place_toy(s, "rubber_ball")
+    game.ensure_cat(s, "gordo")["in_yard"] = True
+    s["occ"]["rubber_ball"] = ["gordo"]
+    s["food_stock"]["dry_food"] = 1
+    game.set_food(s, "dry_food")
+    before = s["food_remaining"]
+    game.tick(s, random.Random(0))
+    assert s["food_remaining"] < before
+    assert s["cats"]["gordo"]["fullness"] > 0.5
+
+
+def test_taste_affects_entry_probability():
+    """①猫ごとにエサの好みで来訪率が変わる(ゴードーは魚より肉気味のドライフードが得意)"""
+    s = fresh()
+    s["food"], s["food_remaining"] = "dry_food", 300
+    p_dry = game._entry_probability(s, "gordo")
+    s["food"], s["food_remaining"] = "wet_food", 300
+    p_wet = game._entry_probability(s, "gordo")
+    assert p_dry > p_wet
+
+
+def test_fullness_lowers_entry_probability():
+    """③満腹の猫は来訪率が下がる"""
+    s = fresh()
+    s["food"], s["food_remaining"] = "dry_food", 300
+    p_hungry = game._entry_probability(s, "gordo")
+    game.ensure_cat(s, "gordo")["fullness"] = 1.0
+    p_full = game._entry_probability(s, "gordo")
+    assert p_full < p_hungry
+
+
+# ---------------------------------------------------------------- フェーズ2: レベル・条件判定・ログ
+def test_level_rises_when_meeting_a_new_cat():
+    """①レベルが行動に応じて上がる(はじめて猫に出会うと上がる)"""
+    s = fresh()
+    s["owned_toys"].append("rubber_ball")
+    game.place_toy(s, "rubber_ball")
+    assert s["level"] == 0
+    game._join(s, "gordo", "rubber_ball", [])
+    assert s["level"] == game.LEVEL_GAINS["met_new_cat"]
+    assert any(e[1] == "met_cat" and e[2] == "gordo" for e in s["log"])
+    level_after_first = s["level"]
+    game._join(s, "gordo", "rubber_ball", [])          # 2回目は「はじめて」ではないので増えない
+    assert s["level"] == level_after_first
+
+
+def test_meets_composite_conditions():
+    """②meets()で複合条件(レベル+所持品など)を判定できる"""
+    s = fresh()
+    assert game.meets(s, None) is True                 # 条件なしは常に満たす
+    assert game.meets(s, {"level": 1}) is False
+    s["level"] = 2
+    assert game.meets(s, {"level": 1}) is True
+
+    assert game.meets(s, {"items": ["smartphone"]}) is False
+    s["ever_had"].add("smartphone")
+    assert game.meets(s, {"items": ["smartphone"]}) is True
+
+    assert game.meets(s, {"flag": "unlocked_jiro"}) is False
+    s["flags"].add("unlocked_jiro")
+    assert game.meets(s, {"flag": "unlocked_jiro"}) is True
+
+    assert game.meets(s, {"met": 1}) is False
+    s["met_actors"]["jiro"] = {}
+    assert game.meets(s, {"met": 1}) is True
+
+    # 複合条件は、すべて満たして初めて True
+    assert game.meets(s, {"level": 2, "flag": "unlocked_jiro", "items": ["smartphone"]}) is True
+    assert game.meets(s, {"level": 3, "flag": "unlocked_jiro"}) is False
+
+
+def test_save_roundtrip_keeps_level_sets_and_log():
+    """③セーブ・読み込みを往復しても壊れない(特に ever_had / flags の set 化)"""
+    s = fresh()
+    s["level"] = 4
+    s["ever_had"] = {"smartphone", "amulet"}
+    s["flags"] = {"unlocked_jiro"}
+    s["met_actors"] = {"jiro": {"trust": 1, "milestones_done": [0], "rewarded": True}}
+    game.set_player_name(s, "  黒猫  ")
+    game._log(s, "test_event", {"x": 1})
+
+    s2 = game.loads(game.dumps(s))
+    assert s2["level"] == 4
+    assert s2["ever_had"] == {"smartphone", "amulet"} and isinstance(s2["ever_had"], set)
+    assert s2["flags"] == {"unlocked_jiro"} and isinstance(s2["flags"], set)
+    assert s2["met_actors"] == {"jiro": {"trust": 1.0, "milestones_done": [0], "rewarded": True}}
+    assert s2["player_name"] == "黒猫"
+    assert s2["log"][-1][1] == "test_event" and s2["log"][-1][2] == {"x": 1}
+
+
+def test_set_player_name_trims_and_limits_length():
+    s = fresh()
+    game.set_player_name(s, "  " + "あ" * 30 + "  ")
+    assert s["player_name"] == "あ" * 20
+
+
+def test_log_is_capped_at_log_max():
+    s = fresh()
+    for i in range(game.LOG_MAX + 10):
+        game._log(s, "x", i)
+    assert len(s["log"]) == game.LOG_MAX
+    assert s["log"][-1][2] == game.LOG_MAX + 9
+
+
+# ---------------------------------------------------------------- フェーズ3: 訪問者・人・ギフトの鎖
+def test_catseye_appears_at_level_5_and_always_brings_a_smartphone():
+    """①出現条件を満たすとキャツアイが現れる(現れた瞬間、必ずスマホをくれる)"""
+    s = fresh()
+    game._tick_actors(s, "garden", random.Random(0), [])
+    assert "catseye_a" not in s["met_actors"]          # まだレベル不足
+
+    s["level"] = 5
+    ev = []
+    game._tick_actors(s, "garden", random.Random(0), ev)
+    assert "catseye_a" in s["met_actors"]
+    assert "smartphone" in s["owned_goods"]
+    assert any(e[0] == "met_actor" and e[1] == "catseye_a" for e in ev)
+    assert any(e[0] == "milestone_gift" and e[1] == "catseye_a" for e in ev)
+
+
+def test_giving_smartphone_to_jiro_grants_turtle_once():
+    """②スマホを渡すと一度だけ亀がもらえる"""
+    s = fresh()
+    s["level"] = 5
+    game._tick_actors(s, "garden", random.Random(0), [])     # catseyeが庭に現れてスマホをくれる(屋敷も解放される)
+    game._tick_actors(s, "mansion", random.Random(0), [])    # じろうさんが屋敷に現れる
+    assert "jiro" in s["met_actors"]
+
+    r = game.give(s, "jiro", "smartphone", random.Random(0))
+    assert r.ok and r.code == "given_reward"
+    assert s["pets"] == {"turtle"}
+    assert "unlocked_obaachan" in s["flags"]
+    assert "smartphone" not in s["owned_goods"] and "smartphone" in s["ever_had"]
+
+
+def test_giving_again_reacts_differently_and_grants_no_second_reward():
+    """③2回目以降は違う反応になる(reward は出ない・レベルも増えない)"""
+    s = fresh()
+    s["level"] = 5
+    game._tick_actors(s, "garden", random.Random(0), [])
+    game._tick_actors(s, "mansion", random.Random(0), [])
+    game.give(s, "jiro", "smartphone", random.Random(0))
+    level_after_first = s["level"]
+
+    s["owned_goods"].add("smartphone")                 # テスト用にもう1台持たせる
+    r = game.give(s, "jiro", "smartphone", random.Random(0))
+    assert r.ok and r.code == "given_thanks"            # 1回目(given_reward)とは違う反応
+    assert s["level"] == level_after_first               # reward が出ないので、レベルは増えない
+    assert s["pets"] == {"turtle"}                       # 亀が2匹になったりはしない
+
+
+def test_obaachan_chain_and_catseyes_second_milestone():
+    """じろうさん経由でおばあちゃんまでつながり、キャツアイも2つめの大事な物(パソコン)を持ってくる"""
+    s = fresh()
+    s["level"] = 5
+    game._tick_actors(s, "garden", random.Random(0), [])
+    game._tick_actors(s, "mansion", random.Random(0), [])
+    game.give(s, "jiro", "smartphone", random.Random(0))
+    assert "obaachan" not in s["met_actors"]             # フラグが立った直後は、まだ_tick_actorsを回していない
+
+    game._tick_actors(s, "mansion", random.Random(0), [])    # おばあちゃんは屋敷側
+    assert "obaachan" in s["met_actors"]
+    game._tick_actors(s, "garden", random.Random(0), [])     # catseyeの2つめのmilestoneは庭側
+    assert "laptop" in s["owned_goods"]                  # catseyeの2つめのmilestone
+
+    s["owned_goods"].add("sweets")
+    r = game.give(s, "obaachan", "sweets", random.Random(0))
+    assert r.ok and r.code == "given_reward"
+    assert "amulet" in s["owned_goods"]
+    assert "unlocked_stage_mansion2" in s["flags"]
+
+
+def test_give_requires_meeting_and_owning_the_item():
+    s = fresh()
+    assert game.give(s, "jiro", "smartphone").code == "not_met"
+    s["level"] = 5
+    game._tick_actors(s, "garden", random.Random(0), [])
+    game._tick_actors(s, "mansion", random.Random(0), [])
+    s["owned_goods"].discard("smartphone")
+    assert game.give(s, "jiro", "smartphone").code == "not_owned"
+
+
+# ---------------------------------------------------------------- 状態描写・validate_world
+def test_fullness_bucket_thresholds():
+    assert game._fullness_bucket(0.0) == "very_hungry"
+    assert game._fullness_bucket(0.24) == "very_hungry"
+    assert game._fullness_bucket(0.25) == "hungry"
+    assert game._fullness_bucket(0.49) == "hungry"
+    assert game._fullness_bucket(0.5) == "content"
+    assert game._fullness_bucket(0.74) == "content"
+    assert game._fullness_bucket(0.75) == "full"
+    assert game._fullness_bucket(1.0) == "full"
+
+
+def test_cat_flavor_text_none_when_not_in_yard():
+    s = fresh()
+    assert game.cat_flavor_text("gordo", s) is None
+
+
+def test_cat_flavor_text_prioritizes_hunger_over_toy():
+    s = fresh()
+    s["owned_toys"].append("rubber_ball")
+    game.place_toy(s, "rubber_ball")
+    game._join(s, "gordo", "rubber_ball", [])
+    s["cats"]["gordo"]["fullness"] = 0.1                # very_hungry
+    text = game.cat_flavor_text("gordo", s)
+    assert text in catalog.FULLNESS_LINES["very_hungry"]
+
+
+def test_cat_flavor_text_uses_toy_lines_and_falls_back_to_default():
+    s = fresh()
+    s["owned_toys"].append("rubber_ball")
+    game.place_toy(s, "rubber_ball")
+    game._join(s, "gordo", "rubber_ball", [])
+    s["cats"]["gordo"]["fullness"] = 0.9                 # very_hungry ではない
+    text = game.cat_flavor_text("gordo", s)
+    assert text in catalog.TOY_LINES["rubber_ball"]
+
+    s["cats"]["gordo"]["toy"] = "no_such_toy"            # TOY_LINES に無いおもちゃ
+    text = game.cat_flavor_text("gordo", s)
+    assert text in catalog.TOY_LINES["default"]
+
+
+def test_cat_flavor_text_is_stable_then_rerolls():
+    """数十tickは同じ一言を指し続け、間隔が来たら引き直す(乱数はその「いつ変わるか」だけに使う)。"""
+    s = fresh()
+    s["owned_toys"].append("rubber_ball")
+    game.place_toy(s, "rubber_ball")
+    game._join(s, "gordo", "rubber_ball", [])
+    c = s["cats"]["gordo"]
+    assert c["flavor_ticks"] == 0                        # 来たばかりなので、次のtickで即引く
+
+    rng = random.Random(0)
+    game.tick(s, rng, [])
+    first_idx, first_ticks = c["flavor_idx"], c["flavor_ticks"]
+    assert game.FLAVOR_MIN_TICKS <= first_ticks <= game.FLAVOR_MAX_TICKS
+
+    for _ in range(first_ticks - 1):                     # 間隔が来る直前まで
+        game.tick(s, rng, [])
+        assert c["flavor_idx"] == first_idx              # 引き直されない
+    game.tick(s, rng, [])                                 # ここで引き直される
+    assert c["flavor_ticks"] >= 1
+
+
+def test_validate_world_detects_id_collisions_and_bad_references():
+    orig_goods = catalog.GOODS
+    try:
+        catalog.GOODS = orig_goods + [('dry_food', 'ダミー', {}, '説明')]     # TOYS/FOODSと衝突するID
+        errors = catalog.validate_world()
+        assert any("dry_food" in e for e in errors)
+    finally:
+        catalog.GOODS = orig_goods
+
+    orig_actors = catalog.ACTORS
+    try:
+        catalog.ACTORS = [('bogus', 'person', 'ダミー', '説明',
+                            {'one_time_reward': {'item': 'no_such_good'}})]
+        errors = catalog.validate_world()
+        assert any("no_such_good" in e for e in errors)
+    finally:
+        catalog.ACTORS = orig_actors
+
+    assert catalog.validate_world() == []                # 実物のカタログは常にクリーンであるべき
 
 
 def test_invariants_hold_over_long_random_play():
@@ -173,6 +456,114 @@ def test_treasure_when_joining_after_3000_minutes():
     game._join(s, "felix", "rubber_ball", ev)                   # 2回目はもらえない
     assert s["pending_treasures"] == ["felix"]
     assert game.collect_treasures(s) == ["felix"] and s["pending_treasures"] == []
+
+
+def test_join_increases_trust():
+    s = stocked(("rubber_ball",))
+    game.ensure_cat(s, "gordo")["trust"] = 0.95
+    ev = []
+    game._join(s, "gordo", "rubber_ball", ev)
+    assert s["cats"]["gordo"]["trust"] == pytest.approx(1.0)     # 上限でクランプされる
+
+
+def test_pet_requires_trust():
+    s = stocked(("rubber_ball",))
+    game.ensure_cat(s, "gordo").update(in_yard=True, toy="rubber_ball")
+    s["occ"]["rubber_ball"] = ["gordo"]
+    r = game.pet(s, "gordo")
+    assert not r.ok and r.code == "low_trust"
+    assert s["cats"]["gordo"]["happiness"] == 0.5                # 変化しない
+
+
+def test_pet_requires_cat_in_yard():
+    s = stocked(("rubber_ball",))
+    game.ensure_cat(s, "gordo")["trust"] = 0.9                   # なついているが庭にはいない
+    r = game.pet(s, "gordo")
+    assert not r.ok and r.code == "not_here"
+
+
+def test_pet_succeeds_with_enough_trust():
+    s = stocked(("rubber_ball",))
+    game.ensure_cat(s, "gordo").update(in_yard=True, toy="rubber_ball", trust=0.8, happiness=0.5)
+    s["occ"]["rubber_ball"] = ["gordo"]
+    r = game.pet(s, "gordo")
+    assert r.ok and r.code == "ok"
+    assert s["cats"]["gordo"]["happiness"] == pytest.approx(0.65)
+    assert s["cats"]["gordo"]["trust"] == pytest.approx(0.85)
+
+
+# ---------------------------------------------------------------- フェーズ4: 場所(PLACES)
+def test_available_places_locked_until_flag_and_switch_rejects_locked():
+    s = fresh()
+    assert game.available_places(s) == ["garden"]              # 最初は庭だけ
+    r = game.switch_place(s, "mansion")
+    assert not r.ok and r.code == "locked"
+    assert s["current_place"] == "garden"                      # 移動していない
+
+    s["flags"].add("unlocked_stage_mansion")
+    assert game.available_places(s) == ["garden", "mansion"]
+    r = game.switch_place(s, "mansion")
+    assert r.ok and s["current_place"] == "mansion"
+
+
+def test_switch_place_keeps_yard_food_and_occ_independent():
+    s = stocked(("rubber_ball",))                              # 庭に rubber_ball を1つ置いた状態
+    s["flags"].add("unlocked_stage_mansion")
+    game._join(s, "gordo", "rubber_ball", [])
+    assert s["cats"]["gordo"]["place"] == "garden"
+
+    r = game.switch_place(s, "mansion")
+    assert r.ok
+    assert s["yard"] == [] and s["occ"] == {} and s["food"] == ""    # 屋敷はまだ何も置いていない
+    s["owned_toys"].append("yarn_ball")
+    game.place_toy(s, "yarn_ball")                               # 屋敷にだけ別のおもちゃを置く
+    assert s["yard"] == ["yarn_ball"]
+
+    game.switch_place(s, "garden")
+    assert s["yard"] == ["rubber_ball"] and s["occ"] == {"rubber_ball": ["gordo"]}    # 庭側は無事に残っている
+    assert "yarn_ball" not in s["yard"]                          # 屋敷のおもちゃは混ざらない
+
+
+def test_tick_advances_every_place_regardless_of_which_is_displayed():
+    """全場所処理: いま見ていない場所の猫も、同じように時間が進む。"""
+    s = stocked(("rubber_ball",))
+    s["flags"].add("unlocked_stage_mansion")
+    game.ensure_cat(s, "gordo").update(in_yard=True, toy="rubber_ball", place="garden", time_in_yard=1)
+    s["occ"]["rubber_ball"] = ["gordo"]
+    game.switch_place(s, "mansion")                              # いまは屋敷を見ている
+    assert s["current_place"] == "mansion"
+
+    game.tick(s, random.Random(1))
+    assert s["current_place"] == "mansion"                       # 表示は屋敷のまま
+    assert s["cats"]["gordo"]["time_in_yard"] == 2                # 庭のゴードーも1分進んでいる
+    assert s["places"]["garden"]["occ"]["rubber_ball"] == ["gordo"]
+
+
+def test_actors_only_appear_in_their_habitat_place():
+    s = fresh()
+    s["level"] = 5
+    game._tick_actors(s, "mansion", random.Random(0), [])        # catseyeは庭専属なので、屋敷側では現れない
+    assert "catseye_a" not in s["met_actors"]
+    game._tick_actors(s, "garden", random.Random(0), [])
+    assert "catseye_a" in s["met_actors"]
+
+
+def test_loads_fills_in_missing_places_from_old_save():
+    """まだ mansion2 が無かった頃のセーブでも、欠けている場所は既定値で補われる。"""
+    s = stocked(("rubber_ball",))
+    d = json.loads(game.dumps(s))
+    d["places"] = {"garden": d["places"]["garden"]}              # mansion/mansion2 が丸ごと無い旧セーブを再現
+    r = game.loads(json.dumps(d))
+    assert set(r["places"]) == {"garden", "mansion", "mansion2"}
+    assert r["places"]["mansion"] == {"yard": [], "occ": {}, "food": "", "food_remaining": 0}
+
+
+def test_loads_resets_unknown_current_place():
+    s = stocked()
+    d = json.loads(game.dumps(s))
+    d["current_place"] = "no_such_place"
+    r = game.loads(json.dumps(d))
+    assert r["current_place"] == "garden"
 
 
 def test_launch_bonus():
@@ -253,7 +644,8 @@ def test_loads_repairs_inconsistent_data():
 
 
 def test_catalog_is_consistent():
-    assert len(game.TOYS) == 24 and len(game.FOODS) == 3 and len(game.CATS) == 5
+    assert len(game.TOYS) == 24 and len(game.FOODS) == 4 and len(game.CATS) == 5
+    assert len(game.GOODS) == 4 and len(game.ACTORS) == 3
     for it in game.ITEMS.values():
         assert it["cur"] in ("s", "g") and it["cost"] > 0 and it["size"] >= 1
         assert it["size"] <= game.SPACE or it["kind"] == "food"
@@ -344,11 +736,12 @@ def big_catalog():
     import catalog
     toys = [("toy%03d" % i, "おもちゃ%d" % i, 5 + i % 90, "s" if i % 3 else "g", 1 + (i % 7 == 0) * 2, "説明%d" % i)
             for i in range(500)]
-    foods = [("food%02d" % i, "エサ%d" % i, 2 + i, "s", 300, "エサの説明") for i in range(40)]
+    foods = [("food%02d" % i, "エサ%d" % i, 2 + i, "s", 300, {}, "エサの説明") for i in range(40)]
     cats = [("cat%04d" % i, "猫%d" % i, "紹介文%d" % i, "お宝%d" % i) for i in range(1000)]
-    game.load_catalog(toys, foods, cats, catalog.CATEGORIES)
+    game.load_catalog(toys, foods, cats, catalog.CATEGORIES, places=catalog.PLACES)
     yield
-    game.load_catalog(catalog.TOYS, catalog.FOODS, catalog.CATS, catalog.CATEGORIES)
+    game.load_catalog(catalog.TOYS, catalog.FOODS, catalog.CATS, catalog.CATEGORIES,
+                       catalog.GOODS, catalog.ACTORS, catalog.PLACES)
 
 
 def test_big_catalog_loads_and_validates(big_catalog):
